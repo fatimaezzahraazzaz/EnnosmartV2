@@ -249,6 +249,7 @@ class EnnoDiagnosticV2FullRuntime:
                     request_name="ennodiagnostic:v2:project_synthesis_reviewed",
                     temperature=0.0,
                     max_output_tokens=4200,
+                    max_complete_output_tokens=4200,
                     prompt_char_limit=self.global_reviewer_config.max_prompt_chars,
                     fail_on_truncation=True,
                 ),

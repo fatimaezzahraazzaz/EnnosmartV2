@@ -84,6 +84,7 @@ import {
 import {
   SourceTextWithDocuments,
   SourceEvidenceCitations,
+  resolveEvidenceDocuments,
   useProjectSourceDocuments,
   type DbSourceDocument,
   type SourceEvidence,
@@ -396,6 +397,7 @@ function V2TraceableSectionV216({
   description,
   icon,
   items,
+  narrative,
   evidenceMap,
   projectId,
   sourceDocuments,
@@ -405,16 +407,99 @@ function V2TraceableSectionV216({
   description?: string
   icon?: any
   items: any[]
+  narrative?: { text: string; evidence_ids: string[] }[]
   evidenceMap: Record<string, SourceEvidence>
   projectId?: number | string
   sourceDocuments: DbSourceDocument[]
   tone?: "default" | "success"
 }) {
+  const [showExtracts, setShowExtracts] = useState(false)
   const Icon = icon
   const values = Array.isArray(items)
     ? items.filter((item: any) => cleanDisplayText(String(item?.text || "")))
     : []
   const toneClass = tone === "success" ? "border-success/20 bg-success/5" : ""
+  const claims = projectId && Array.isArray(narrative)
+    ? narrative.flatMap((claim) => {
+        const text = typeof claim?.text === "string" ? cleanDisplayText(claim.text) : ""
+        const evidence = resolveV2EvidenceV216(claim?.evidence_ids, evidenceMap)
+          .filter((item) => resolveEvidenceDocuments([item], sourceDocuments, true).length > 0)
+        return text && evidence.length > 0 ? [{ text, evidence }] : []
+      })
+    : []
+  const citationNumbers = new Map<SourceEvidence, number>()
+  for (const { evidence } of claims) {
+    for (const proof of evidence) {
+      if (!citationNumbers.has(proof)) citationNumbers.set(proof, citationNumbers.size + 1)
+    }
+  }
+
+  const renderExtracts = () => (
+    <div className="min-w-0 rounded-xl border bg-white/80 p-3 sm:p-4">
+      {values.length > 0 ? (
+        <ol className="space-y-3">
+          {values.map((item: any, index: number) => {
+            const evidences = resolveV2EvidenceV216(item?.evidence_ids, evidenceMap)
+            const category = cleanDisplayText(String(item?.category || ""))
+            const sourceRole = cleanDisplayText(String(item?.source_role || ""))
+            const temporalStatus = cleanDisplayText(String(item?.temporal_status || ""))
+            const temporalLabel: Record<string, string> = {
+              planned: "Prévu",
+              in_progress: "En cours",
+              performed: "Réalisé",
+            }
+            return (
+              <li key={`${title}-${index}`} className="rounded-lg border bg-background p-3">
+                <div className="flex items-start gap-3">
+                  <span className="grid size-6 shrink-0 place-items-center rounded-full bg-brand/10 text-[10px] font-semibold text-brand">
+                    {index + 1}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    {category ? (
+                      <Badge variant="outline" className="mb-2 text-[10px]">
+                        {category.replace(/_/g, " ")}
+                      </Badge>
+                    ) : null}
+                    {(sourceRole === "project_evidence" || temporalLabel[temporalStatus]) ? (
+                      <div className="mb-2 flex flex-wrap gap-1.5">
+                        {sourceRole === "project_evidence" ? (
+                          <Badge variant="outline" className="text-[10px]">Projet</Badge>
+                        ) : null}
+                        {temporalLabel[temporalStatus] ? (
+                          <Badge variant="outline" className="text-[10px]">
+                            {temporalLabel[temporalStatus]}
+                          </Badge>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <p className="text-sm leading-6 text-foreground">
+                      {cleanDisplayText(String(item?.text || ""))}
+                    </p>
+                    {evidences.length > 0 && projectId ? (
+                      <div className="mt-2">
+                        <SourceTextWithDocuments
+                          projectId={projectId}
+                          text={cleanDisplayText(String(
+                            (evidences[0] as any)?.document_name || (evidences[0] as any)?.document || "Voir la preuve"
+                          ))}
+                          documents={sourceDocuments}
+                          evidence={evidences}
+                          compact
+                          hideTextWhenMatched
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </li>
+            )
+          })}
+        </ol>
+      ) : (
+        <p className="text-sm text-muted-foreground">Aucun élément disponible.</p>
+      )}
+    </div>
+  )
 
   return (
     <Card className={`min-w-0 ${toneClass}`}>
@@ -426,70 +511,30 @@ function V2TraceableSectionV216({
         {description ? <CardDescription className="text-xs">{description}</CardDescription> : null}
       </CardHeader>
       <CardContent className="min-w-0">
-        <div className="min-w-0 rounded-xl border bg-white/80 p-3 sm:p-4">
-          {values.length > 0 ? (
-            <ol className="space-y-3">
-              {values.map((item: any, index: number) => {
-                const evidences = resolveV2EvidenceV216(item?.evidence_ids, evidenceMap)
-                const category = cleanDisplayText(String(item?.category || ""))
-                const sourceRole = cleanDisplayText(String(item?.source_role || ""))
-                const temporalStatus = cleanDisplayText(String(item?.temporal_status || ""))
-                const temporalLabel: Record<string, string> = {
-                  planned: "Prévu",
-                  in_progress: "En cours",
-                  performed: "Réalisé",
-                }
-                return (
-                  <li key={`${title}-${index}`} className="rounded-lg border bg-background p-3">
-                    <div className="flex items-start gap-3">
-                      <span className="grid size-6 shrink-0 place-items-center rounded-full bg-brand/10 text-[10px] font-semibold text-brand">
-                        {index + 1}
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        {category ? (
-                          <Badge variant="outline" className="mb-2 text-[10px]">
-                            {category.replace(/_/g, " ")}
-                          </Badge>
-                        ) : null}
-                        {(sourceRole === "project_evidence" || temporalLabel[temporalStatus]) ? (
-                          <div className="mb-2 flex flex-wrap gap-1.5">
-                            {sourceRole === "project_evidence" ? (
-                              <Badge variant="outline" className="text-[10px]">Projet</Badge>
-                            ) : null}
-                            {temporalLabel[temporalStatus] ? (
-                              <Badge variant="outline" className="text-[10px]">
-                                {temporalLabel[temporalStatus]}
-                              </Badge>
-                            ) : null}
-                          </div>
-                        ) : null}
-                        <p className="text-sm leading-6 text-foreground">
-                          {cleanDisplayText(String(item?.text || ""))}
-                        </p>
-                        {evidences.length > 0 && projectId ? (
-                          <div className="mt-2">
-                            <SourceTextWithDocuments
-                              projectId={projectId}
-                              text={cleanDisplayText(String(
-                                (evidences[0] as any)?.document_name || (evidences[0] as any)?.document || "Voir la preuve"
-                              ))}
-                              documents={sourceDocuments}
-                              evidence={evidences}
-                              compact
-                              hideTextWhenMatched
-                            />
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
-                  </li>
-                )
-              })}
-            </ol>
-          ) : (
-            <p className="text-sm text-muted-foreground">Aucun élément disponible.</p>
-          )}
-        </div>
+        {claims.length > 0 && projectId ? (
+          <div className="space-y-4">
+            <p className="max-w-prose text-sm leading-7 text-foreground [overflow-wrap:anywhere] sm:text-base">
+              {claims.map(({ text, evidence }, index) => (
+                <span key={index}>
+                  {index > 0 ? " " : ""}{text}
+                  <SourceEvidenceCitations
+                    projectId={projectId}
+                    documents={sourceDocuments}
+                    evidence={evidence}
+                    exactDocument
+                    citationNumbers={evidence.map((proof) => citationNumbers.get(proof)!)}
+                  />
+                </span>
+              ))}
+            </p>
+            <details onToggle={(event) => setShowExtracts(event.currentTarget.open)}>
+              <summary className="cursor-pointer rounded py-2 text-sm font-medium text-brand underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-brand">
+                Voir les constats extraits ({values.length})
+              </summary>
+              {showExtracts ? renderExtracts() : null}
+            </details>
+          </div>
+        ) : renderExtracts()}
       </CardContent>
     </Card>
   )
@@ -8086,6 +8131,7 @@ export function DiagnosisPage(
                 description="Méthodes et approches techniques identifiées dans le dossier."
                 icon={Search}
                 items={v2Methods}
+                narrative={v2ProjectSynthesis.section_narratives?.method}
                 evidenceMap={v2EvidenceMap}
                 projectId={project.id}
                 sourceDocuments={sourceDocuments}
@@ -8108,6 +8154,7 @@ export function DiagnosisPage(
                 description="Nécessité des étapes, distinction R&D / ingénierie classique et possibilité d’aller directement à la solution finale."
                 icon={Search}
                 items={v2RndSteps}
+                narrative={v2ProjectSynthesis.section_narratives?.demarche}
                 evidenceMap={v2EvidenceMap}
                 projectId={project.id}
                 sourceDocuments={sourceDocuments}
@@ -8134,6 +8181,7 @@ export function DiagnosisPage(
                 description="Valeurs et constats effectivement observés pendant les travaux."
                 icon={TrendingUp}
                 items={v2Results}
+                narrative={v2ProjectSynthesis.section_narratives?.result}
                 evidenceMap={v2EvidenceMap}
                 projectId={project.id}
                 sourceDocuments={sourceDocuments}
@@ -8161,6 +8209,7 @@ export function DiagnosisPage(
                 description="Ce que le projet mesure, sans présumer qu'une valeur a déjà été obtenue."
                 icon={TrendingUp}
                 items={v2Metrics}
+                narrative={v2ProjectSynthesis.section_narratives?.metric}
                 evidenceMap={v2EvidenceMap}
                 projectId={project.id}
                 sourceDocuments={sourceDocuments}
@@ -8185,6 +8234,7 @@ export function DiagnosisPage(
                 description="Paramètres, jeux de données, conditions expérimentales et contraintes techniques."
                 icon={FileText}
                 items={v2Parameters}
+                narrative={v2ProjectSynthesis.section_narratives?.parameter}
                 evidenceMap={v2EvidenceMap}
                 projectId={project.id}
                 sourceDocuments={sourceDocuments}

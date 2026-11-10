@@ -12,6 +12,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from .schemas import CanonicalEntity, ExtractionItem, TraceablePoint
 from .structured_facts import build_project_fact_lists
+from .section_narratives import (
+    NARRATIVE_INSTRUCTIONS, narrative_candidates, narrative_prompt, validated_narratives,
+)
 
 from .semantic_extractor import LLMClientProtocol, parse_json_payload
 from .prompt_budget import clip, content_char_budget, is_prompt_too_long_error
@@ -134,6 +137,7 @@ class ProjectSynthesis:
     needs_review: bool = False
 
     generation_error: str = ""
+    section_narratives: Dict[str, List[dict]] = field(default_factory=dict)
 
 
 
@@ -2073,10 +2077,25 @@ class ProjectSynthesizer:
             "reponse JSON, retourne [] : elles seront fournies par "
             "l'inventaire tracable, sans limite arbitraire."
         )
+        narrative_evidence = {
+            item.evidence.evidence_id: item.evidence for item in extractions
+        }
+        candidates = narrative_candidates(structured, narrative_evidence) if globally_reviewed else {}
+        narrative_content = narrative_prompt(candidates)
+        if narrative_content:
+            expanded_system = synthesis_system + "\n\n" + NARRATIVE_INSTRUCTIONS
+            expanded_budget = content_char_budget(synthesis_llm, expanded_system)
+            if expanded_budget is None or expanded_budget - len(narrative_content) >= 4000:
+                synthesis_system = expanded_system
+            else:
+                candidates = {}
+                narrative_content = ""
         # Le client refuse (reviewed) ou coupe au milieu (legacy) un prompt
         # plus long que son budget. On construit donc une vue compacte et
         # complète du dossier qui tient dans ce budget, sans troncature aveugle.
         budget = content_char_budget(synthesis_llm, synthesis_system)
+        if budget is not None:
+            budget -= len(narrative_content)
         if budget is not None and len(prompt) > budget:
             full_chars = len(prompt)
             prompt = build_compact_project_synthesis_prompt(
@@ -2091,7 +2110,7 @@ class ProjectSynthesizer:
         try:
 
             try:
-                raw = synthesis_llm.extract_json(synthesis_system, prompt)
+                raw = synthesis_llm.extract_json(synthesis_system, prompt + narrative_content)
             except Exception as first_exc:
                 # Refus local avant tout appel payant : une seule reprise,
                 # nettement plus compacte.
@@ -2106,7 +2125,7 @@ class ProjectSynthesizer:
                     f"apres refus du client : {first_exc}",
                     flush=True,
                 )
-                raw = synthesis_llm.extract_json(synthesis_system, prompt)
+                raw = synthesis_llm.extract_json(synthesis_system, prompt + narrative_content)
 
 
 
@@ -2846,6 +2865,9 @@ class ProjectSynthesizer:
             metrics=metrics,
 
             results=results,
+            section_narratives=validated_narratives(
+                data.get("section_narratives"), candidates, narrative_evidence,
+            ),
 
 
 

@@ -455,6 +455,7 @@ export function resolveLocalDocuments(
 export function resolveEvidenceDocuments(
   evidence: SourceEvidence[],
   documents: DbSourceDocument[],
+  exact = false,
 ): ResolvedDocument[] {
   const resolved = new Map<number, ResolvedDocument>()
 
@@ -463,10 +464,18 @@ export function resolveEvidenceDocuments(
     const byId = directId
       ? documents.find((document) => Number(document.id) === directId)
       : undefined
-    const matched =
-      byId ||
-      findBestDocument(evidenceDocumentName(item), documents) ||
-      virtualDocumentFromEvidence(item)
+    const name = evidenceDocumentName(item)
+    const basename = (value: string) => value.replace(/\\/g, "/").split("/").pop()?.toLowerCase()
+    const exactMatches = exact && !byId && !directId && name
+      ? documents.filter((doc) =>
+          [doc.filename, doc.stored_filename].some((filename) =>
+            filename && basename(filename) === basename(name)
+          )
+        )
+      : []
+    const matched = byId || (exact
+      ? (exactMatches.length === 1 ? exactMatches[0] : undefined)
+      : findBestDocument(name, documents) || virtualDocumentFromEvidence(item))
 
     if (!matched) return
 
@@ -742,18 +751,20 @@ export function SourceEvidenceCitations({
   documents,
   evidence,
   citationNumbers,
+  exactDocument = false,
 }: {
   projectId: number | string
   documents: DbSourceDocument[]
   evidence: SourceEvidence[]
   citationNumbers?: number[]
+  exactDocument?: boolean
 }) {
   const entries = useMemo(() => {
     return (evidence || []).map((item, index) => {
-      const resolved = resolveEvidenceDocuments([item], documents || [])[0]
+      const resolved = resolveEvidenceDocuments([item], documents || [], exactDocument)[0]
       return { resolved: resolved || null, evidenceIndex: index }
     })
-  }, [documents, evidence])
+  }, [documents, evidence, exactDocument])
   const [selected, setSelected] = useState<ResolvedDocument | null>(null)
 
   if (!entries.length) return null
@@ -775,6 +786,9 @@ export function SourceEvidenceCitations({
             title={entry.resolved
               ? `Voir la preuve ${citationNumber} dans le document`
               : `Document de la preuve ${citationNumber} non résolu`}
+            aria-label={entry.resolved
+              ? `Ouvrir la preuve ${citationNumber} dans ${entry.resolved.document.filename}`
+              : `Preuve ${citationNumber} indisponible`}
           >
             [{citationNumber}]
           </button>
