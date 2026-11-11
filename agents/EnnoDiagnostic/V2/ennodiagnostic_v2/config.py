@@ -38,9 +38,32 @@ class GlobalReviewerConfig:
     provider: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_GLOBAL_REASONER_PROVIDER", "openai"))
     global_reasoner_model: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_GLOBAL_REASONER_MODEL", "gpt-5"))
     reasoning_effort: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_GLOBAL_REASONER_EFFORT", "high"))
+    # Relecture ciblée des faits incertains (hors verrous) du chemin rapide.
+    # "high" la rendait très lente (jusqu'à 90 min) ; la variable la rétablit.
+    targeted_reasoning_effort: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_TARGETED_REVIEW_EFFORT", "medium"))
     max_prompt_chars: int = 110000
     max_output_tokens: int = 12000
     batch_size: int = 28
+
+
+def _int_setting(name: str, default: int) -> int:
+    try:
+        return int(_global_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class JudgeConfig:
+    """Jugements Démarche R&D et Frascati : modèle fort, prompt jamais coupé en silence."""
+    enabled: bool = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_JUDGE_STRONG_MODEL", "1").lower() in {"1", "true", "yes", "on"})
+    provider: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_GLOBAL_REASONER_PROVIDER", "openai"))
+    model: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_JUDGE_MODEL", "") or _global_setting("ENNOSMART_DIAGNOSTIC_GLOBAL_REASONER_MODEL", "gpt-5"))
+    reasoning_effort: str = field(default_factory=lambda: _global_setting("ENNOSMART_DIAGNOSTIC_JUDGE_EFFORT", "medium"))
+    # ~140 000 tokens, pour une fenêtre de 400 000 : les faits de tout le dossier
+    # (300 à 440 000 car. sur les runs 52 à 55) tiennent avec leurs citations.
+    max_prompt_chars: int = field(default_factory=lambda: _int_setting("ENNOSMART_DIAGNOSTIC_JUDGE_MAX_PROMPT_CHARS", 500000))
+    max_output_tokens: int = 16000
 
 
 @dataclass(frozen=True)

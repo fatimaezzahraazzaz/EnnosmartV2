@@ -7,7 +7,7 @@ from uuid import uuid4
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .cir_scoring import CIRDiagnosticScore, CIRScorer
-from .config import GlobalFastPathConfig, GlobalReviewerConfig, PipelineConfig
+from .config import GlobalFastPathConfig, GlobalReviewerConfig, JudgeConfig, PipelineConfig
 from .global_fast_path import GlobalFastExtractor
 from .completeness_auditor import CompletenessAuditor
 from .global_project_reviewer import GlobalProjectReviewer, reviewed_fact_view
@@ -16,10 +16,29 @@ from .pipeline import EnnoDiagnosticV2
 from .project_frascati import ProjectFrascatiAssessment, ProjectFrascatiEvaluator
 from .project_synthesis import ProjectSynthesis, ProjectSynthesizer
 from .rnd_approach import RnDApproachAnalyzer, RnDApproachAssessment
-from .runtime_adapters import EnnoSmartLLMAdapter, GlobalFastLLMAdapter, GlobalReasonerLLMAdapter
+from .runtime_adapters import (
+    EnnoSmartLLMAdapter, GlobalFastLLMAdapter, GlobalReasonerLLMAdapter, JudgeLLMAdapter,
+)
 from .schemas import DocumentInput, PipelineResult
 from .semantic_extractor import LLMClientProtocol
 from .execution import StageTimings, diagnostic_workers
+
+
+def _judge_adapter(config: JudgeConfig, request_name: str, fallback_output_tokens: int):
+    """Modèle fort pour R&D et Frascati ; à défaut, modèle par défaut, jamais coupé en silence."""
+    if config.enabled:
+        try:
+            return JudgeLLMAdapter(config, request_name=request_name)
+        except Exception as exc:
+            print(f"[EnnoDiagnostic][Judge] modèle fort indisponible ({type(exc).__name__}:{exc}) ; "
+                  "modèle par défaut sans coupe silencieuse", flush=True)
+    return EnnoSmartLLMAdapter(
+        request_name=request_name,
+        temperature=0.0,
+        max_output_tokens=fallback_output_tokens,
+        prompt_char_limit=config.max_prompt_chars,
+        fail_on_truncation=True,
+    )
 
 VERSION = "ennodiagnostic_v2_full_runtime_1"
 
@@ -218,17 +237,10 @@ class EnnoDiagnosticV2FullRuntime:
             self.domain_tags,
         )
 
-        rnd = rnd_llm or EnnoSmartLLMAdapter(
-            request_name="ennodiagnostic:v2:rnd_approach",
-            temperature=0.0,
-            max_output_tokens=3200,
-        )
+        judge_config = JudgeConfig()
+        rnd = rnd_llm or _judge_adapter(judge_config, "ennodiagnostic:v2:rnd_approach", 3200)
 
-        frascati = frascati_llm or EnnoSmartLLMAdapter(
-            request_name="ennodiagnostic:v2:project_frascati",
-            temperature=0.0,
-            max_output_tokens=2600,
-        )
+        frascati = frascati_llm or _judge_adapter(judge_config, "ennodiagnostic:v2:project_frascati", 2600)
 
         self.core = EnnoDiagnosticV2(
             semantic_llm=semantic,

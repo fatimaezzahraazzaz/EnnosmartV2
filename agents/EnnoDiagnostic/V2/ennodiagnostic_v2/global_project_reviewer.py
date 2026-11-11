@@ -9,12 +9,15 @@ import os
 import tempfile
 import unicodedata
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Iterable
 from pathlib import Path
 
 from .config import GlobalReviewerConfig
+from .execution import diagnostic_workers
 from .schemas import CanonicalEntity, Chunk, ExtractionItem
 from .semantic_extractor import LLMClientProtocol, parse_json_payload
 
@@ -139,24 +142,55 @@ _THEME_STOP = {
 }
 
 
-def _fold(text: str) -> str:
-    value = unicodedata.normalize("NFKD", str(text or "").casefold())
+# La réconciliation recalcule les mêmes proximités des milliers de fois
+# (_pack_themes reconstruit le prompt à chaque fait ajouté) : 80 faits
+# coûtaient 190 s de CPU, 268 faits plusieurs dizaines de minutes. Les caches
+# ci-dessous rendent exactement les mêmes valeurs, calculées une seule fois.
+@lru_cache(maxsize=65536)
+def _fold_text(text: str) -> str:
+    value = unicodedata.normalize("NFKD", text.casefold())
     return "".join(char for char in value if not unicodedata.combining(char))
 
 
-def _theme_terms(item: ExtractionItem) -> set[str]:
-    text = " ".join((item.statement, item.technical_object, item.unresolved_question))
+def _fold(text: str) -> str:
+    return _fold_text(str(text or ""))
+
+
+@lru_cache(maxsize=65536)
+def _terms_of(statement: str, technical_object: str, unresolved_question: str) -> frozenset:
+    text = " ".join((statement, technical_object, unresolved_question))
     words = re.findall(r"[a-z0-9]{4,}", _fold(text))
-    return {word.rstrip("s") for word in words if word not in _THEME_STOP}
+    return frozenset(word.rstrip("s") for word in words if word not in _THEME_STOP)
+
+
+def _theme_terms(item: ExtractionItem) -> set[str]:
+    return set(_terms_of(item.statement, item.technical_object, item.unresolved_question))
+
+
+@lru_cache(maxsize=131072)
+def _text_relatedness(
+    left_statement: str, left_object: str, left_question: str,
+    right_statement: str, right_object: str, right_question: str,
+) -> float:
+    a = _terms_of(left_statement, left_object, left_question)
+    b = _terms_of(right_statement, right_object, right_question)
+    overlap = len(a & b) / min(len(a), len(b)) if a and b else 0.0
+    matcher = SequenceMatcher(None, _fold(left_statement), _fold(right_statement))
+    # quick_ratio() majore ratio() : sous 0,78, la similarité de séquence
+    # ne compte pas, inutile de la calculer.
+    if matcher.real_quick_ratio() < 0.78 or matcher.quick_ratio() < 0.78:
+        return overlap
+    sequence = matcher.ratio()
+    return max(overlap, sequence if sequence >= 0.78 else 0.0)
 
 
 def _relatedness(left: ExtractionItem, right: ExtractionItem) -> float:
     if left.evidence.evidence_id == right.evidence.evidence_id:
         return 1.0
-    a, b = _theme_terms(left), _theme_terms(right)
-    overlap = len(a & b) / min(len(a), len(b)) if a and b else 0.0
-    sequence = SequenceMatcher(None, _fold(left.statement), _fold(right.statement)).ratio()
-    return max(overlap, sequence if sequence >= 0.78 else 0.0)
+    return _text_relatedness(
+        left.statement, left.technical_object, left.unresolved_question,
+        right.statement, right.technical_object, right.unresolved_question,
+    )
 
 
 def _thematic_components(items: list[ExtractionItem]) -> list[list[ExtractionItem]]:
@@ -513,6 +547,63 @@ class GlobalProjectReviewer:
                 )
             )
 
+    def _review_batches(
+        self,
+        system: str,
+        planned: list[list[ExtractionItem]],
+        prompt_factory,
+        by_id: dict[str, ExtractionItem],
+        original_entities_by_item: dict[str, list[str]],
+        evidence_to_item: dict[str, list[ExtractionItem]],
+    ) -> list[tuple[list[ExtractionItem], dict[str, dict]]]:
+        """Lots indépendants en parallèle, chacun avec son propre client.
+
+        Les résultats et l'audit sont remis dans l'ordre des lots : les
+        décisions sont les mêmes qu'en exécution séquentielle. Sans client
+        duplicable (doubles de test, autres fournisseurs), rien ne change.
+        """
+        def sequential():
+            groups = []
+            for batch in planned:
+                groups.extend(self._review_with_recovery(
+                    system, batch, prompt_factory, by_id,
+                    original_entities_by_item, evidence_to_item,
+                ))
+            return groups
+
+        workers = min(diagnostic_workers(), len(planned))
+        fork = getattr(self.llm, "fork", None)
+        if workers <= 1 or not callable(fork):
+            return sequential()
+        clones = []
+        for _ in planned:
+            llm = fork()
+            if llm is None:
+                return sequential()
+            clone = GlobalProjectReviewer(llm, self.config)
+            clone._review_audit = []
+            clones.append(clone)
+
+        def run(job):
+            clone, batch = job
+            return clone._review_with_recovery(
+                system, batch, prompt_factory, by_id,
+                original_entities_by_item, evidence_to_item,
+            )
+
+        print(
+            f"[EnnoDiagnostic][GlobalProjectReviewer] {len(planned)} lot(s), "
+            f"{workers} en parallèle, raisonnement={self.config.reasoning_effort}",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="diagnostic-review") as pool:
+            results = list(pool.map(run, zip(clones, planned)))
+        groups = []
+        for clone, batch_groups in zip(clones, results):
+            self._review_audit.extend(clone._review_audit)
+            groups.extend(batch_groups)
+        return groups
+
     def _pack_themes(self, components: list[list[ExtractionItem]], prompt_factory, system: str) -> list[list[ExtractionItem]]:
         batches: list[list[ExtractionItem]] = []
         current: list[ExtractionItem] = []
@@ -678,12 +769,10 @@ class GlobalProjectReviewer:
                     continue
             if planned is None or factory is None:
                 raise ValueError("reconciliation_evidence_exceeds_context_budget")
-            groups = []
-            for batch in planned:
-                groups.extend(self._review_with_recovery(
-                    RECONCILIATION_SYSTEM, batch, factory, by_id,
-                    original_entities_by_item, evidence_to_item,
-                ))
+            groups = self._review_batches(
+                RECONCILIATION_SYSTEM, planned, factory, by_id,
+                original_entities_by_item, evidence_to_item,
+            )
         final = {}
         for _, decisions in groups:
             if set(final) & set(decisions):
@@ -775,10 +864,32 @@ class GlobalProjectReviewer:
                     )
                     changed = True
 
+    def _targeted_reviewer(self) -> "GlobalProjectReviewer":
+        """Même relecteur avec le raisonnement prévu pour la relecture ciblée."""
+        effort = str(getattr(self.config, "targeted_reasoning_effort", "") or "").strip()
+        if not effort or effort == self.config.reasoning_effort:
+            return self
+        fork = getattr(self.llm, "fork", None)
+        if not callable(fork):
+            return self
+        try:
+            llm = fork(reasoning_effort=effort)
+        except TypeError:
+            return self
+        if llm is None:
+            return self
+        return GlobalProjectReviewer(llm, replace(self.config, reasoning_effort=effort))
+
     def review_cached(
         self, chunks, extractions, entities, *, cache_dir=None, corpus_fingerprint="",
     ) -> dict:
         """Cache only complete targeted reviews; revalidate exact evidence on replay."""
+        reviewer = self._targeted_reviewer()
+        if reviewer is not self:
+            return reviewer.review_cached(
+                chunks, extractions, entities,
+                cache_dir=cache_dir, corpus_fingerprint=corpus_fingerprint,
+            )
         items = list(extractions)
         chunks, entities = list(chunks), list(entities)
         signature = {
@@ -912,12 +1023,10 @@ class GlobalProjectReviewer:
                         continue
                 if planned is None or factory is None:
                     raise ValueError("candidate_evidence_exceeds_context_budget")
-                groups = []
-                for batch in planned:
-                    groups.extend(self._review_with_recovery(
-                        REVIEW_SYSTEM, batch, factory, by_id,
-                        original_entities_by_item, evidence_to_item,
-                    ))
+                groups = self._review_batches(
+                    REVIEW_SYSTEM, planned, factory, by_id,
+                    original_entities_by_item, evidence_to_item,
+                )
             drafts: dict[str, dict] = {}
             batch_by_id: dict[str, int] = {}
             for batch_number, (batch, decisions) in enumerate(groups, 1):

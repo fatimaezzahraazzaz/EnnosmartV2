@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 from modules.LLM.llm_client import LLMClient
-from .config import GlobalFastPathConfig, GlobalReviewerConfig
+from .config import GlobalFastPathConfig, GlobalReviewerConfig, JudgeConfig
 
 
 class EnnoSmartLLMAdapter:
@@ -108,6 +109,8 @@ class EnnoSmartLLMAdapter:
 class GlobalReasonerLLMAdapter:
     """Modèle dédié ; refuse toute coupure automatique du dossier."""
 
+    supports_fork = True
+
     def __init__(self, config: GlobalReviewerConfig):
         if config.provider not in {"openai", "openrouter"}:
             raise ValueError("Le raisonnement élevé est supporté ici par openai/openrouter.")
@@ -117,6 +120,13 @@ class GlobalReasonerLLMAdapter:
         self.client.allow_cross_provider_fallback = False
         self.client.openai_fallback_models = []
         self.client.openrouter_fallback_models = []
+
+    def fork(self, reasoning_effort: Optional[str] = None) -> "GlobalReasonerLLMAdapter":
+        """Client propre à un lot : les métadonnées du dernier appel ne se mélangent pas."""
+        config = self.config
+        if reasoning_effort and reasoning_effort != config.reasoning_effort:
+            config = replace(config, reasoning_effort=reasoning_effort)
+        return GlobalReasonerLLMAdapter(config)
 
     def extract_json(self, system_prompt: str, user_prompt: str) -> str:
         prompt = (
@@ -159,6 +169,40 @@ class GlobalFastLLMAdapter:
             retries=0,
             json_mode=True,
             request_name=getattr(self, "request_name", "ennodiagnostic:v2:global_fast_extract"),
+            prompt_char_limit=self.config.max_prompt_chars,
+            fail_on_truncation=True,
+            reasoning_effort=self.config.reasoning_effort,
+            background=self.config.provider == "openai",
+        )
+
+
+class JudgeLLMAdapter:
+    """Démarche R&D et Frascati : modèle fort, prompt refusé plutôt que coupé.
+
+    Le prompt est construit pour tenir dans ``config.max_prompt_chars``
+    (voir judge_prompt.py) ; ``fail_on_truncation`` garantit qu'aucun
+    passage n'est retiré en silence par le client central.
+    """
+
+    def __init__(self, config: JudgeConfig, *, request_name: str):
+        if config.provider not in {"openai", "openrouter"}:
+            raise ValueError("Le modèle des jugements est supporté ici par openai/openrouter.")
+        self.config = config
+        self.request_name = request_name
+        self.client = LLMClient(model=config.model, provider=config.provider)
+        self.client.allow_cross_provider_fallback = False
+        self.client.openai_fallback_models = []
+        self.client.openrouter_fallback_models = []
+
+    def extract_json(self, system_prompt: str, user_prompt: str) -> str:
+        return self.client.generate(
+            prompt="INSTRUCTIONS SPECIFIQUES\n" + str(system_prompt or "").strip()
+            + "\n\nCONTENU A ANALYSER\n" + str(user_prompt or "").strip(),
+            temperature=0.0,
+            max_output_tokens=self.config.max_output_tokens,
+            retries=1,
+            json_mode=True,
+            request_name=self.request_name,
             prompt_char_limit=self.config.max_prompt_chars,
             fail_on_truncation=True,
             reasoning_effort=self.config.reasoning_effort,
