@@ -109,14 +109,12 @@ class DiagnosticLatencyRegressionTests(unittest.TestCase):
                 self.reviewed.extend(ids)
                 return json.dumps({"decisions": [{
                     "item_id": item_id, "kind": "method", "source_role": "project_evidence",
-                    "project_admission": True, "uncertain": False, "duplicate_of": None,
-                    "related_project_evidence_ids": [], "related_lock_ids": [],
-                    "reason": "Méthode attestée.",
+                    "uncertain": False, "reason": "Méthode attestée.",
                 } for item_id in ids]})
 
         llm = Reviewer()
         review = GlobalProjectReviewer(
-            llm, GlobalReviewerConfig(max_output_tokens=1450),
+            llm, GlobalReviewerConfig(max_output_tokens=1200),
         ).review_cached([], items, [])
         self.assertEqual(review["status"], "complete", review["error"])
         self.assertGreater(review["batch_count"], 1)

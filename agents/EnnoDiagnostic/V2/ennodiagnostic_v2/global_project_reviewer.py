@@ -69,13 +69,20 @@ RECONCILIATION_SYSTEM = (
     "uncertain=true et project_admission=false."
 )
 
-TARGETED_REVIEW_SYSTEM = REVIEW_SYSTEM + "\n\n" + """
-Le dossier a déjà fait l'objet d'une extraction exhaustive et d'une recherche
-des verrous. Vérifie seulement la provenance et la catégorie de chaque fait
-incertain avec sa citation exacte. Le plan et les autres faits sont des repères,
-seule la citation attribue le fait. Garde toutes les décisions, y compris un
-fait incertain ou extérieur au projet. Ne fusionne deux constats que si les
-conditions expérimentales et les valeurs sont équivalentes d'après les preuves.
+TARGETED_REVIEW_SYSTEM = """
+Pour chaque ITEM_ID cible, vérifie la provenance et la catégorie du constat à
+partir de sa citation exacte et du plan du dossier R&D. Un fait du projet peut
+être prévu ou réalisé. Les résultats d'un article ou d'un autre projet restent
+extérieurs. Une intention ou un exemple chiffré ne constitue pas un résultat.
+METHOD est le protocole ou mécanisme, DEMARCHE une étape de recherche, PARAMETER
+une variable ou configuration, METRIC la grandeur mesurée et RESULT le constat
+ou la valeur obtenue. Ne modifie pas le fait, la citation ni sa temporalité.
+Retourne une décision pour chaque ITEM_ID et aucun identifiant supplémentaire.
+Si la citation ne suffit pas à l'attribution ou au classement, uncertain=true.
+Retourne uniquement {"decisions":[{"item_id":"...","kind":"...",
+"source_role":"...","uncertain":false,"reason":"justification en une phrase"}]}.
+kind vaut objective, lock, method, demarche, parameter, metric ou result.
+source_role vaut project_evidence, literature, admin, context ou unknown.
 """.strip()
 
 
@@ -227,14 +234,15 @@ def _thematic_components(items: list[ExtractionItem]) -> list[list[ExtractionIte
     )
 
 
-def _decision_capacity(max_output_tokens: int) -> int:
+def _decision_capacity(max_output_tokens: int, system: str) -> int:
     # Inclut une marge pour le raisonnement élevé et les justifications JSON.
-    return max(1, (int(max_output_tokens) - 900) // 250)
+    tokens_per_decision = 125 if system == TARGETED_REVIEW_SYSTEM else 250
+    return max(1, (int(max_output_tokens) - 900) // tokens_per_decision)
 
 
 def _fits(prompt: str, system: str, count: int, config: GlobalReviewerConfig) -> bool:
     return (
-        count <= _decision_capacity(config.max_output_tokens)
+        count <= _decision_capacity(config.max_output_tokens, system)
         and len(prompt) + len(system) + 180 <= config.max_prompt_chars
     )
 
@@ -354,6 +362,26 @@ class GlobalProjectReviewer:
         original_entities_by_item: dict[str, list[str]],
         evidence_to_item: dict[str, list[ExtractionItem]],
     ) -> dict[str, dict]:
+        def normalize(row, item):
+            if system == TARGETED_REVIEW_SYSTEM:
+                # L'identité, les preuves et les liens de cette revue sont
+                # déterminés par le candidat. Le modèle ne les recopie pas.
+                row = {
+                    **row,
+                    "project_admission": (
+                        row.get("source_role") == "project_evidence"
+                        and row.get("uncertain") is False
+                        and item.evidence.quote_verified
+                        and not (row.get("kind") == "result" and item.temporal_status == "planned")
+                    ),
+                    "duplicate_of": None,
+                    "related_project_evidence_ids": [],
+                    "related_lock_ids": [],
+                }
+            return self._normalize_decision(
+                row, item, by_id, original_entities_by_item, evidence_to_item,
+            )
+
         if not _fits(prompt, system, len(targets), self.config):
             raise ValueError("review_prompt_exceeds_budget")
         raw = self.llm.extract_json(system, prompt)
@@ -385,10 +413,7 @@ class GlobalProjectReviewer:
         for row in rows:
             item_id = str(row["item_id"])
             try:
-                normalized[item_id] = self._normalize_decision(
-                    row, by_id[item_id], by_id, original_entities_by_item,
-                    evidence_to_item,
-                )
+                normalized[item_id] = normalize(row, by_id[item_id])
             except ValueError as exc:
                 errors[item_id] = str(exc)
         for item in targets:
@@ -427,9 +452,7 @@ class GlobalProjectReviewer:
                         matches = returned[item_id]
                         if len(matches) != 1:
                             raise ValueError("missing_or_duplicate_targeted_decision")
-                        normalized[item_id] = self._normalize_decision(
-                            matches[0], item, by_id, original_entities_by_item, evidence_to_item,
-                        )
+                        normalized[item_id] = normalize(matches[0], item)
                     except ValueError as exc:
                         retry_entry["validation_errors"][item_id] = str(exc)
             except (RuntimeError, ValueError, TypeError) as exc:
@@ -911,7 +934,7 @@ class GlobalProjectReviewer:
         items = list(extractions)
         chunks, entities = list(chunks), list(entities)
         signature = {
-            "version": "fast-targeted-review-v2", "corpus": corpus_fingerprint,
+            "version": "fast-targeted-review-v3", "corpus": corpus_fingerprint,
             "prompt": TARGETED_REVIEW_SYSTEM,
             "provider": self.config.provider, "model": self.config.global_reasoner_model,
             "effort": self.config.reasoning_effort,
