@@ -62,6 +62,37 @@ def _attach_source_roles(entities, extractions):
     return output
 
 
+def _admit_reviewed_evidence(extractions, revisions):
+    """Les faits incertains validés par la revue ciblée deviennent des preuves projet.
+
+    Sans cela, ils restent « context » et le qualificateur ne peut pas les citer
+    comme preuve d'un verrou. Un fait requalifié en verrou n'est pas promu :
+    la liste des verrous reste celle de l'extraction.
+    """
+    output, promoted = [], []
+    for item in extractions:
+        row = revisions.get(item.item_id)
+        if (
+            row is not None
+            and item.kind != "lock"
+            and row["reviewed_kind"] != "lock"
+            and row["project_admission"]
+            and row["source_role"] == "project_evidence"
+            and not row["needs_review"]
+            and item.evidence.quote_verified
+        ):
+            item = replace(item, kind=row["reviewed_kind"], needs_review=False, metadata={
+                **(item.metadata or {}),
+                "source_role": "project_evidence",
+                "project_admission": True,
+                "targeted_review_admitted": True,
+                "pre_review_kind": item.kind,
+            })
+            promoted.append(item)
+        output.append(item)
+    return output, promoted
+
+
 VERSION = "ennodiagnostic_v2_simple_semantic_pipeline_1"
 
 class EnnoDiagnosticV2:
@@ -262,12 +293,27 @@ class EnnoDiagnosticV2:
                             ),
                         })
                         decisions = [revisions.get(row["item_id"], row) for row in decisions]
+                        # Les faits admis par la revue servent aussi de preuves
+                        # aux verrous, familles, R&D et Frascati, comme lorsque
+                        # la revérification était faite pendant la lecture des lots.
+                        extractions, promoted = _admit_reviewed_evidence(extractions, revisions)
+                        targeted_audit["evidence_admitted_count"] = len(promoted)
+                        if promoted:
+                            non_lock_items = [
+                                item for item in extractions
+                                if item.kind != "lock" and (item.metadata or {}).get("project_admission")
+                            ]
+                            entities = _attach_source_roles(
+                                lock_entities + fuse_items(non_lock_items, self.config.fusion),
+                                extractions,
+                            )
                     else:
                         targeted_audit["status"] = "coverage_mismatch"
                 print(
                     f"[EnnoDiagnostic][GlobalProjectReviewer] {targeted_audit['status']}: "
                     f"{targeted_audit['reviewed_count']}/{len(targeted)} faits incertains, "
-                    f"{targeted_audit.get('newly_admitted_count', 0)} admis",
+                    f"{targeted_audit.get('newly_admitted_count', 0)} admis, "
+                    f"{targeted_audit.get('evidence_admitted_count', 0)} preuve(s) projet ajoutée(s)",
                     flush=True,
                 )
             global_review = {
