@@ -348,6 +348,7 @@ class GlobalFastExtractor:
         # The output reservation includes reasoning tokens on GPT-5.
         mode = "global" if (
             prompt_chars <= min(self.config.max_prompt_chars, self.config.target_lot_chars)
+            and len(passages) <= self.config.target_lot_passages
             and input_tokens + output_tokens + 4096 < context_window
             and output_tokens >= estimated_output
         ) else "multi_lot"
@@ -696,7 +697,14 @@ class GlobalFastExtractor:
             lots.append(passages[start:end])
             start = end
             remaining -= size
-        return lots
+        # Les tableaux peuvent créer beaucoup de passages très courts. Leur
+        # lecture et la vérification de leurs identifiants coûtent aussi du temps.
+        bounded_lots = []
+        for lot in lots:
+            parts = ceil(len(lot) / self.config.target_lot_passages)
+            size = ceil(len(lot) / parts)
+            bounded_lots.extend(lot[start : start + size] for start in range(0, len(lot), size))
+        return bounded_lots
 
     def _validated_lot(self, passages, by_passage):
         rows, calls = self._read_lot(passages)

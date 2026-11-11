@@ -78,4 +78,5 @@ class GlobalFastPathConfig:
     context_window_tokens: int = 400000
     passage_max_chars: int = 650
     target_lot_chars: int = 42000
+    target_lot_passages: int = 100
     max_workers: int = 6

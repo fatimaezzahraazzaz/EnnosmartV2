@@ -26,6 +26,19 @@ class DiagnosticLatencyRegressionTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in extractor._covered_call.call_args_list],
                          [self.passages, self.passages[:2], self.passages[2:]])
 
+    def test_many_short_passages_are_split_without_losing_any(self):
+        docs = [
+            DocumentInput(str(i), f"Essai {i}", "Le projet a testé la résistance du film.")
+            for i in range(235)
+        ]
+        passages = build_passages(docs)
+        config = GlobalFastPathConfig(max_workers=1)
+        extractor = GlobalFastExtractor(None, config)
+        self.assertEqual(extractor.preflight(docs)["mode"], "multi_lot")
+        lots = extractor._lots(passages)
+        self.assertLessEqual(max(map(len, lots)), config.target_lot_passages)
+        self.assertEqual([passage for lot in lots for passage in lot], passages)
+
     def test_unreadable_lot_cannot_report_complete_coverage(self):
         extractor = GlobalFastExtractor(Mock(), GlobalFastPathConfig())
         extractor._covered_call = Mock(side_effect=RuntimeError("provider error"))
