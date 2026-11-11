@@ -2283,6 +2283,19 @@ def get_latest_previous_cir_comparison(
             detail=f"Lecture comparaison CIR précédent impossible : {exc}",
         )
 
+@router.get("/projects/{project_id}/diagnostic/run-status")
+def get_diagnostic_run_status(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Permet à la page de savoir qu'un diagnostic tourne déjà, même après l'avoir quittée."""
+    from services.diagnostic_reset_service import diagnostic_activity
+
+    project = get_project_for_user(db, project_id, current_user)
+    return diagnostic_activity(project.id)
+
+
 @router.get("/projects/{project_id}/diagnostic/preparation-status")
 def get_diagnostic_preparation_status(
     project_id: int,

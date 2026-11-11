@@ -91,6 +91,11 @@ import {
 } from "@/components/ennosmart/source-documents-dialog"
 type ConsultantDecision = "garde" | "rejete" | "reformuler" | "en_attente"
 type RunMode = "diagnostic" | null
+type DiagnosticRunStatus = { running: boolean; started_at?: string; elapsed_seconds?: number }
+
+// Le serveur garde la trace d'un diagnostic en cours, même si la page a été quittée.
+const getDiagnosticRunStatus = (projectId: number) =>
+  apiRequest<DiagnosticRunStatus>(`/projects/${projectId}/diagnostic/run-status`)
 type CirLoadStatus = "loading" | "ready" | "error"
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"
@@ -5147,8 +5152,11 @@ export function DiagnosisPage(
   const [manualFormError, setManualFormError] = useState("")
 
   const [runningMode, setRunningMode] = useState<RunMode>(null)
+  // Diagnostic lancé avant l'arrivée sur la page, ou depuis un autre onglet.
+  const [remoteRun, setRemoteRun] = useState<DiagnosticRunStatus | null>(null)
 
-  const running = runningMode !== null
+  const localRunning = runningMode !== null
+  const running = localRunning || Boolean(remoteRun?.running)
 
   const display = diagnosticBundle?.display || {}
   const latestRun = diagnosticBundle?.latest_run || null
@@ -5912,6 +5920,7 @@ export function DiagnosisPage(
         setPreviousCirFile(null)
         setPreviousCirCompareLoading(false)
         setPreviousCirUploading(false)
+        setRemoteRun(null)
         const year = Number(selected?.year)
         setPreviousCirYear(Number.isFinite(year) ? String(year - 1) : "")
       }
@@ -5931,12 +5940,14 @@ export function DiagnosisPage(
         if (!signal.aborted) setPreviousCirListStatus("error")
       })
 
-      const [documentsData, diagnosticData, corpusReviewData] = await Promise.all([
+      const [documentsData, diagnosticData, corpusReviewData, runStatus] = await Promise.all([
         getDocuments(projectId).catch(() => []),
         getDiagnosticLatest(projectId).catch(() => null),
         getDiagnosticCorpusReview(projectId).catch(() => null),
+        getDiagnosticRunStatus(projectId).catch(() => null),
       ])
       if (signal.aborted) return
+      setRemoteRun(runStatus?.running ? runStatus : null)
       const diagnosticVerrous = diagnosticData?.validation_verrous || diagnosticData?.display?.validation_verrous
       setVerrous(Array.isArray(diagnosticVerrous) ? diagnosticVerrous : [])
       setDocuments(Array.isArray(documentsData) ? documentsData : [])
@@ -5969,6 +5980,28 @@ export function DiagnosisPage(
       projectScope.current = { id: null }
     }
   }, [])
+
+  // Diagnostic lancé ailleurs : on suit son état et on affiche le résultat à la fin.
+  const currentProjectId = project?.id ?? null
+  const remoteRunning = Boolean(remoteRun?.running)
+  useEffect(() => {
+    if (!remoteRunning || localRunning || currentProjectId == null) return
+    let stopped = false
+    const timer = window.setInterval(async () => {
+      const status = await getDiagnosticRunStatus(currentProjectId).catch(() => null)
+      if (stopped || status == null || projectScope.current.id !== currentProjectId) return
+      if (status.running) {
+        setRemoteRun(status)
+      } else {
+        setRemoteRun(null)
+        void loadData()
+      }
+    }, 15000)
+    return () => {
+      stopped = true
+      window.clearInterval(timer)
+    }
+  }, [remoteRunning, localRunning, currentProjectId])
 
   const submitManualVerrou = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -6028,7 +6061,7 @@ export function DiagnosisPage(
   const stopProgress = (_success = true) => undefined
 
   const runFullDiagnostic = async () => {
-    if (!project) return
+    if (!project || running) return
 
     setError("")
     setActiveTab("overview")
@@ -6036,15 +6069,23 @@ export function DiagnosisPage(
 
     try {
       await runDiagnostic(project.id)
+      setRemoteRun(null)
       await loadData()
       stopProgress(true)
     } catch (err) {
       stopProgress(false)
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Impossible de lancer le diagnostic."
-      )
+      // Diagnostic déjà en cours, ou réponse perdue alors que le serveur continue :
+      // la page attend la fin au lieu d'afficher une erreur.
+      const status = await getDiagnosticRunStatus(project.id).catch(() => null)
+      if (status?.running) {
+        setRemoteRun(status)
+      } else {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Impossible de lancer le diagnostic."
+        )
+      }
     } finally {
       setTimeout(() => setRunningMode(null), 700)
     }
@@ -6528,7 +6569,7 @@ export function DiagnosisPage(
             <Button
               type="button"
               className="min-h-11 bg-brand hover:bg-brand/90"
-              disabled={corpusReviewSaving || diagnosticDocumentsCount + corpusKeepIds.size === 0}
+              disabled={corpusReviewSaving || running || diagnosticDocumentsCount + corpusKeepIds.size === 0}
               onClick={() => void saveCorpusReview(true)}
             >
               {corpusReviewSaving ? (
@@ -6571,7 +6612,7 @@ export function DiagnosisPage(
                 value={project.id}
                 onChange={(event) => void loadData(Number(event.target.value))}
                 className="min-h-11 min-w-0 rounded-md border border-border bg-background px-3 text-sm sm:col-span-2 sm:min-h-9 2xl:col-span-1 2xl:w-72"
-                disabled={running}
+                disabled={localRunning}
               >
                 {projects.map((item) => (
                   <option key={item.id} value={item.id}>
@@ -6592,14 +6633,14 @@ export function DiagnosisPage(
               ) : (
                 <Play data-icon="inline-start" />
               )}
-              Lancer le diagnostic
+              {running ? "Diagnostic en cours…" : "Lancer le diagnostic"}
             </Button>
 
             <Button
               variant="ghost"
               className="min-h-11 w-full sm:col-span-2 sm:min-h-9 2xl:col-span-1 2xl:w-auto"
               onClick={() => void loadData()}
-              disabled={running}
+              disabled={localRunning}
             >
               <RefreshCw data-icon="inline-start" />
               Actualiser
@@ -6660,7 +6701,12 @@ export function DiagnosisPage(
           <Loader2 className="size-5 shrink-0 animate-spin text-brand motion-reduce:animate-none" aria-hidden="true" />
           <div>
             <p className="text-sm font-semibold text-foreground">Diagnostic en cours…</p>
-            <p className="mt-1 text-xs text-muted-foreground">Votre dossier est en cours d’analyse. Les résultats s’afficheront ici à la fin du diagnostic.</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {remoteRun?.started_at
+                ? `Lancé à ${new Date(remoteRun.started_at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}. `
+                : ""}
+              Votre dossier est en cours d’analyse. Vous pouvez quitter cette page : les résultats s’afficheront ici à la fin du diagnostic.
+            </p>
           </div>
         </div>
       )}

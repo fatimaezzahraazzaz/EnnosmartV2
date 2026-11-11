@@ -1,14 +1,98 @@
 """A new diagnostic starts with no previous agent runs for that project."""
+from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
 from threading import Lock
+import json
+import os
 import shutil
+import tempfile
+import time
 
 from sqlalchemy import MetaData, Table, delete, inspect, or_, select
 from db.models import Article, DiagnosticRun, ProjectArtifact, ScholarRun, Verrou
 
+try:
+    import fcntl
+except ImportError:  # Windows en local : seul le verrou du processus s'applique.
+    fcntl = None
+
 _project_locks = {}
 _locks_guard = Lock()
+BUSY_MESSAGE = 'Une préparation ou un diagnostic est déjà en cours pour ce projet.'
+# Fichiers partagés par tous les processus de l'API dans le même conteneur. Le
+# système libère le verrou si un processus s'arrête en plein diagnostic.
+_LOCK_DIR = Path(os.getenv('ENNOSMART_DIAGNOSTIC_LOCK_DIR') or Path(tempfile.gettempdir()) / 'ennosmart-diagnostic-locks')
+
+
+def _lock_path(project_id) -> Path:
+    return _LOCK_DIR / f'project-{int(project_id)}.lock'
+
+
+def _acquire_process_lock(project_id, operation: str):
+    if fcntl is None:
+        return None
+    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(_lock_path(project_id), 'a+', encoding='utf-8')
+    for attempt in range(5):
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            # Une simple lecture d'état peut tenir le verrou un instant.
+            if attempt == 4:
+                handle.close()
+                raise RuntimeError(BUSY_MESSAGE)
+            time.sleep(0.1)
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({
+        'operation': operation,
+        'started_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'pid': os.getpid(),
+    }))
+    handle.flush()
+    return handle
+
+
+def _release_process_lock(handle) -> None:
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.flush()
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def diagnostic_activity(project_id) -> dict:
+    """Indique si une préparation ou un diagnostic tourne pour ce projet, dans n'importe quel processus."""
+    with _locks_guard:
+        local = _project_locks.get(int(project_id))
+    local_running = bool(local is not None and local.locked())
+    path = _lock_path(project_id)
+    if fcntl is None or not path.exists():
+        return {'running': local_running}
+    with open(path, 'a+', encoding='utf-8') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            try:
+                info = json.loads(handle.read() or '{}')
+            except ValueError:
+                info = {}
+            status = {'running': True}
+            if isinstance(info, dict):
+                status.update({key: info[key] for key in ('operation', 'started_at') if key in info})
+                try:
+                    started = datetime.fromisoformat(str(info.get('started_at')))
+                    status['elapsed_seconds'] = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+                except (TypeError, ValueError):
+                    pass
+            return status
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return {'running': local_running}
 
 
 def exclusive_project_diagnostic(function):
@@ -18,9 +102,14 @@ def exclusive_project_diagnostic(function):
         with _locks_guard:
             lock = _project_locks.setdefault(int(project.id), Lock())
         if not lock.acquire(blocking=False):
-            raise RuntimeError('Une préparation ou un diagnostic est déjà en cours pour ce projet.')
+            raise RuntimeError(BUSY_MESSAGE)
         try:
-            return function(db, project, *args, **kwargs)
+            handle = _acquire_process_lock(project.id, function.__name__)
+            try:
+                return function(db, project, *args, **kwargs)
+            finally:
+                if handle is not None:
+                    _release_process_lock(handle)
         finally:
             lock.release()
     return wrapped
