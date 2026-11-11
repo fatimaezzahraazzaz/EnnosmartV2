@@ -2,6 +2,7 @@ from __future__ import annotations
 
 DIAGNOSTIC_SERVICE_VERSION = "v151_ennodiagnostic_v2_only"
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -886,10 +887,7 @@ def _normalize_ai_report(raw: Dict[str, Any]) -> Dict[str, Any]:
     })
 
 
-def run_ai_detector_if_enabled(
-    project: Project,
-    agent_out_dir: Optional[Path] = None,
-) -> Dict[str, Any]:
+def _analyze_ai_detector(project_store: Any) -> Dict[str, Any]:
     """
     Lance le module historique AI_DETECTOR sur le corpus fulltext V2.
 
@@ -903,8 +901,6 @@ def run_ai_detector_if_enabled(
     try:
         from modules.AI_DETECTOR import run_ai_detection_on_fulltext_corpus
 
-        project_store = get_project_store(project)
-        output_root = Path(agent_out_dir or project_store.project_dir)
         fulltext_corpus_dir = (
             Path(project_store.documents_processed_dir)
             / "fulltext_rag_v1"
@@ -926,20 +922,6 @@ def run_ai_detector_if_enabled(
         )
         normalized = _normalize_ai_report(raw_report)
         normalized["backend_adapter"] = adapter_report
-
-        # L'agent EnnoDiagnostic lit ce fichier via self.diagnostic_dir.
-        save_json(output_root / "ennodiagnostic" / "ai_detection_report.json", normalized)
-
-        # On garde aussi une copie backend/reporting.
-        save_json(output_root / "diagnostics" / "ai_detection_report.json", normalized)
-
-        # Et une copie dans le ProjectStore annuel pour le front/latest.
-        try:
-            ps = get_project_store(project)
-            save_json(ps.diagnostics_dir / "ai_detection_report.json", normalized)
-            save_json(ps.project_dir / "ennodiagnostic" / "ai_detection_report.json", normalized)
-        except Exception:
-            pass
 
         summary = normalized.get("summary") or {}
         print(
@@ -1100,6 +1082,42 @@ def run_previous_cir_comparison(project: Project, report: Dict[str, Any]) -> Dic
         return failed
 
 
+def _save_ai_detection(report: Dict[str, Any], project_store: Any,
+                       agent_out_dir: Optional[Path] = None) -> Dict[str, Any]:
+    if not report.get("ok"):
+        return report
+
+    output_root = Path(agent_out_dir or project_store.project_dir)
+    primary = (
+        output_root / "ennodiagnostic" / "ai_detection_report.json",
+        output_root / "diagnostics" / "ai_detection_report.json",
+    )
+    try:
+        for path in primary:
+            save_json(path, report)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    for path in (
+        project_store.diagnostics_dir / "ai_detection_report.json",
+        project_store.project_dir / "ennodiagnostic" / "ai_detection_report.json",
+    ):
+        if path not in primary:
+            try:
+                save_json(path, report)
+            except Exception:
+                pass
+    return report
+
+
+def run_ai_detector_if_enabled(
+    project: Project, agent_out_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    project_store = get_project_store(project)
+    report = _analyze_ai_detector(project_store)
+    return _save_ai_detection(report, project_store, agent_out_dir)
+
+
 def run_true_ennodiagnostic_agent(
     project: Project,
     prior_pipeline: Optional[Dict[str, Any]] = None,
@@ -1107,8 +1125,8 @@ def run_true_ennodiagnostic_agent(
     """
     Point d'entrée backend EnnoDiagnostic.
 
-    V2 reste le moteur de diagnostic. La détection IA est ensuite exécutée
-    comme module indépendant sur le même corpus fulltext. La comparaison CIR
+    V2 et la détection IA travaillent en parallèle sur le même corpus fulltext.
+    Les résultats de détection sont enregistrés après la réussite du moteur V2. La comparaison CIR
     se lance depuis son point d'entrée dédié, sur le diagnostic enregistré.
     """
     ensure_ennosmart_imports()
@@ -1120,9 +1138,12 @@ def run_true_ennodiagnostic_agent(
         flush=True,
     )
 
-    v2_report = sanitize_json_value(
-        run_ennodiagnostic_v2(project)
-    )
+    project_store = get_project_store(project)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="diagnostic-ai-detector") as pool:
+        ai_future = pool.submit(_analyze_ai_detector, project_store)
+        v2_report = sanitize_json_value(run_ennodiagnostic_v2(project))
+        ai_report = sanitize_json_value(ai_future.result())
+    ai_report = _save_ai_detection(ai_report, project_store)
 
     diagnostic_v2 = (
         v2_report.get("diagnostic_v2")
@@ -1216,9 +1237,6 @@ def run_true_ennodiagnostic_agent(
         },
     }
 
-    ai_report = sanitize_json_value(
-        run_ai_detector_if_enabled(project)
-    )
     report["ai_detection_report"] = ai_report
     if ai_report.get("ok"):
         report["independent_modules"]["ai_detector"] = "completed_fulltext"

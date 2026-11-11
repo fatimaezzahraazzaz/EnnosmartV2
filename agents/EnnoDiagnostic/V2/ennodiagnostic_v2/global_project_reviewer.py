@@ -69,6 +69,16 @@ RECONCILIATION_SYSTEM = (
     "uncertain=true et project_admission=false."
 )
 
+TARGETED_REVIEW_SYSTEM = REVIEW_SYSTEM + "\n\n" + """
+Le dossier a déjà fait l'objet d'une extraction exhaustive et d'une recherche
+des verrous. Vérifie seulement la provenance et la catégorie de chaque fait
+incertain avec sa citation exacte. Le plan et les autres faits sont des repères,
+seule la citation attribue le fait. Garde toutes les décisions, y compris un
+fait incertain ou extérieur au projet. Ne fusionne deux constats que si les
+conditions expérimentales et les valeurs sont équivalentes d'après les preuves.
+""".strip()
+
+
 THEMATIC_SYSTEM = """
 Organise les faits candidats d'un dossier R&D en thèmes techniques pour préparer
 une relecture globale. Un même thème peut réunir des faits provenant de plusieurs
@@ -204,8 +214,9 @@ def _thematic_components(items: list[ExtractionItem]) -> list[list[ExtractionIte
 
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
-            if _relatedness(items[i], items[j]) >= 0.34:
-                parent[root(j)] = root(i)
+            left, right = root(i), root(j)
+            if left != right and _relatedness(items[i], items[j]) >= 0.34:
+                parent[right] = left
     groups: dict[int, list[ExtractionItem]] = defaultdict(list)
     for i, item in enumerate(items):
         groups[root(i)].append(item)
@@ -248,7 +259,6 @@ class GlobalProjectReviewer:
 
     def _plan_themes(self, items: list[ExtractionItem]) -> tuple[list[list[ExtractionItem]], str]:
         """Plan sémantique du modèle ; regroupement déterministe si indisponible."""
-        fallback = _thematic_components(items)
         prompt = "FAITS À ORGANISER (la classification finale utilisera les preuves exactes) :\n" + "\n".join(
             f"{item.item_id} | document={item.evidence.document_id} | "
             f"type_local={item.kind} | provenance_locale="
@@ -257,9 +267,9 @@ class GlobalProjectReviewer:
             for item in items
         )
         if len(prompt) + len(THEMATIC_SYSTEM) + 180 > self.config.max_prompt_chars:
-            return fallback, "deterministic"
+            return _thematic_components(items), "deterministic"
         if len(items) > max(1, self.config.max_output_tokens // 30):
-            return fallback, "deterministic"
+            return _thematic_components(items), "deterministic"
         try:
             data = parse_json_payload(self.llm.extract_json(THEMATIC_SYSTEM, prompt))
             themes = data.get("themes") if isinstance(data, dict) else None
@@ -284,7 +294,7 @@ class GlobalProjectReviewer:
             ))
             return groups, "model"
         except Exception:
-            return fallback, "deterministic"
+            return _thematic_components(items), "deterministic"
 
     @staticmethod
     def _initial_prompt(context: str, targets: list[ExtractionItem]) -> str:
@@ -642,10 +652,8 @@ class GlobalProjectReviewer:
         scored: dict[str, tuple[float, ExtractionItem]] = {}
         for target in targets:
             candidates = [
-                (max(
-                    _relatedness(target, other),
-                    1.0 if theme_by_id[target.item_id] == theme_by_id[other.item_id] else 0.0,
-                ), other)
+                (1.0 if theme_by_id[target.item_id] == theme_by_id[other.item_id]
+                 else _relatedness(target, other), other)
                 for other in items
                 if other.item_id not in target_ids
                 and batch_by_id[other.item_id] != batch_by_id[target.item_id]
@@ -896,8 +904,8 @@ class GlobalProjectReviewer:
         items = list(extractions)
         chunks, entities = list(chunks), list(entities)
         signature = {
-            "version": "fast-targeted-review-v1", "corpus": corpus_fingerprint,
-            "prompt": REVIEW_SYSTEM + RECONCILIATION_SYSTEM,
+            "version": "fast-targeted-review-v2", "corpus": corpus_fingerprint,
+            "prompt": TARGETED_REVIEW_SYSTEM,
             "provider": self.config.provider, "model": self.config.global_reasoner_model,
             "effort": self.config.reasoning_effort,
             "items": [(i.item_id, i.kind, i.statement, i.temporal_status,
@@ -928,7 +936,7 @@ class GlobalProjectReviewer:
                 return {**result, "decisions": [normalized[i.item_id] for i in items], "cache_hit": True}
             except (OSError, ValueError, TypeError, KeyError):
                 pass
-        result = self.review(chunks, items, entities)
+        result = self.review(chunks, items, entities, targeted=True)
         if path and result.get("status") == "complete" and result.get("coverage") == 1.0:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -945,6 +953,8 @@ class GlobalProjectReviewer:
         chunks: Iterable[Chunk],
         extractions: Iterable[ExtractionItem],
         entities: Iterable[CanonicalEntity],
+        *,
+        targeted: bool = False,
     ) -> dict:
         items = list(extractions)
         chunks = list(chunks)
@@ -980,12 +990,11 @@ class GlobalProjectReviewer:
             f"GROUPES ISSUS DE LA CONSOLIDATION :\n{entity_index}\n\n"
         )
         full_prompt = self._initial_prompt(full_context, items)
+        system = TARGETED_REVIEW_SYSTEM if targeted else REVIEW_SYSTEM
         try:
-            components = _thematic_components(items)
-            theme_plan_source = "not_needed"
-            if _fits(full_prompt, REVIEW_SYSTEM, len(items), self.config):
+            if _fits(full_prompt, system, len(items), self.config):
                 groups = self._review_with_recovery(
-                    REVIEW_SYSTEM, items,
+                    system, items,
                     lambda targets: self._initial_prompt(full_context, targets),
                     by_id, original_entities_by_item, evidence_to_item,
                 )
@@ -1003,9 +1012,14 @@ class GlobalProjectReviewer:
                         "lock_observations": [d for d in ordered if d["original_kind"] == "lock"],
                         "batch_count": 1, "reconciliation_calls": 0, "error": "",
                     }
-                components, theme_plan_source = self._plan_themes(items)
+                components, theme_plan_source = (
+                    ([], "not_needed") if targeted else self._plan_themes(items)
+                )
             else:
-                components, theme_plan_source = self._plan_themes(items)
+                components, theme_plan_source = (
+                    (_thematic_components(items), "deterministic")
+                    if targeted else self._plan_themes(items)
+                )
                 planned = None
                 factory = None
                 contexts = [
@@ -1019,7 +1033,7 @@ class GlobalProjectReviewer:
                 for context in contexts:
                     candidate_factory = lambda targets, context=context: self._initial_prompt(context, targets)
                     try:
-                        planned = self._pack_themes(components, candidate_factory, REVIEW_SYSTEM)
+                        planned = self._pack_themes(components, candidate_factory, system)
                         factory = candidate_factory
                         break
                     except ValueError:
@@ -1027,7 +1041,7 @@ class GlobalProjectReviewer:
                 if planned is None or factory is None:
                     raise ValueError("candidate_evidence_exceeds_context_budget")
                 groups = self._review_batches(
-                    REVIEW_SYSTEM, planned, factory, by_id,
+                    system, planned, factory, by_id,
                     original_entities_by_item, evidence_to_item,
                 )
             drafts: dict[str, dict] = {}
@@ -1041,10 +1055,15 @@ class GlobalProjectReviewer:
                 drafts.update(decisions)
             if set(drafts) != set(by_id):
                 raise ValueError("initial_coverage_incomplete")
-            final, reconcile_count = self._reconcile(
-                items, drafts, components, batch_by_id, document_map, entity_index,
-                by_id, original_entities_by_item, evidence_to_item,
-            )
+            if targeted:
+                # Les verrous ont leur propre consolidation. Ici chaque constat
+                # a déjà été revu avec sa preuve et le contexte du dossier.
+                final, reconcile_count = drafts, 0
+            else:
+                final, reconcile_count = self._reconcile(
+                    items, drafts, components, batch_by_id, document_map, entity_index,
+                    by_id, original_entities_by_item, evidence_to_item,
+                )
             # Une reprise ciblée échouée ne peut être réadmise par la passe
             # finale, même si cette dernière produit une décision plausible.
             for item_id, draft in drafts.items():
@@ -1056,7 +1075,8 @@ class GlobalProjectReviewer:
             self._validate_final(final, items, evidence_to_item)
             ordered = [final[item.item_id] for item in items]
             return {
-                **base, "status": "complete", "mode": "multi_lot",
+                **base, "status": "complete",
+                "mode": "targeted_multi_lot" if targeted else "multi_lot",
                 "reviewed_count": len(ordered), "coverage": 1.0,
                 "decisions": ordered,
                 "lock_observations": [d for d in ordered if d["original_kind"] == "lock"],

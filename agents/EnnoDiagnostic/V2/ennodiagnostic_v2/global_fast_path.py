@@ -299,13 +299,14 @@ def _literature_marker(passage: Passage) -> bool:
 
 class GlobalFastExtractor:
     def __init__(self, llm: LLMClientProtocol, config: GlobalFastPathConfig, cache_dir: Path | None = None,
-                 *, completeness_auditor=None):
+                 *, completeness_auditor=None, defer_uncertain_review: bool = False):
         self.llm = llm
         self.config = config
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self._rejected: list[dict] = []
         self._generation_audit: list[dict] = []
         self.completeness_auditor = completeness_auditor
+        self.defer_uncertain_review = defer_uncertain_review
         self.debug_sink = None
 
     def _audit_completeness(self, rows: list[dict], passages: list[Passage]) -> tuple[list[dict], dict]:
@@ -368,6 +369,7 @@ class GlobalFastExtractor:
             "schema": "facts-v1", "controls": CONTROL_VERSION, "provider": self.config.provider,
             "model": self.config.model, "reasoning_effort": self.config.reasoning_effort,
             "passage_max_chars": self.config.passage_max_chars,
+            **({"defer_uncertain_review": True} if self.defer_uncertain_review else {}),
             # passage_id dépend de l'ordre de chargement ; cet ordre fait donc
             # partie de la clé du cache, même si le contenu est identique.
             "documents": [(doc.document_id, doc.name, _sha(doc.text)) for doc in documents],
@@ -583,7 +585,9 @@ class GlobalFastExtractor:
         for index, row in enumerate(rows):
             try:
                 normalized = self._validate(row, by_passage)
-                if normalized["needs_review"]:
+                if normalized["needs_review"] and (
+                    not self.defer_uncertain_review or normalized["kind"] == "lock"
+                ):
                     pending.append((index, row, "uncertain_fact"))
                 results[index] = normalized
             except (ValueError, TypeError, KeyError) as exc:
@@ -731,7 +735,9 @@ class GlobalFastExtractor:
                     continue
                 worker = None
                 if callable(fork):
-                    worker = GlobalFastExtractor(fork(), self.config)
+                    worker = GlobalFastExtractor(
+                        fork(), self.config, defer_uncertain_review=self.defer_uncertain_review,
+                    )
                     worker.debug_sink = self.debug_sink
                     future = pool.submit(worker._validated_lot, lot, local)
                 else:

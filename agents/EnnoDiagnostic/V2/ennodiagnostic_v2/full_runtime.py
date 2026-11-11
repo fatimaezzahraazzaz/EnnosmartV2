@@ -189,6 +189,11 @@ class EnnoDiagnosticV2FullRuntime:
                 # La construction du modèle dédié ne bloque pas le pipeline legacy.
                 global_reviewer = None
 
+        if fast_extractor is not None and global_reviewer is not None:
+            # Le reviewer relit déjà chaque fait non-verrou incertain avec sa
+            # preuve. Les réparations de preuves invalides restent immédiates.
+            fast_extractor.defer_uncertain_review = True
+
         semantic = ContextualLLMAdapter(
             semantic_llm or EnnoSmartLLMAdapter(
                 request_name="ennodiagnostic:v2:semantic_extract",

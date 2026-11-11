@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from unittest.mock import Mock
 
@@ -73,3 +74,52 @@ class DiagnosticLatencyRegressionTests(unittest.TestCase):
                          [[item.evidence.evidence_id] for item in facts])
         self.assertTrue(all(entry["project_admission"] for entry in review["decisions"]))
 
+    def test_valid_uncertain_fact_is_preserved_for_the_targeted_reviewer(self):
+        p = self.passages[0]
+        row = {
+            "kind": "method", "statement": "Le projet a testé la résistance du film.",
+            "source_role": "context", "temporal_status": "performed",
+            "passage_ids": [p.passage_id], "document_ids": [p.document_id],
+            "needs_review": True,
+        }
+        extractor = GlobalFastExtractor(
+            Mock(), GlobalFastPathConfig(), defer_uncertain_review=True,
+        )
+        items, calls = extractor._validated_rows([row], {p.passage_id: p})
+        self.assertEqual(calls, 0)
+        self.assertTrue(items[0]["needs_review"])
+        self.assertEqual(items[0]["passage_ids"], [p.passage_id])
+
+    def test_targeted_review_decides_every_fact_in_one_pass_across_lots(self):
+        items = [
+            ExtractionItem(
+                f"item-{i}", "method", f"Méthode de l'essai {i}",
+                EvidenceRef(f"proof-{i}", str(i), f"Essai {i}", f"chunk-{i}",
+                            f"L'essai {i} utilise cette méthode.", quote_verified=True),
+            )
+            for i in range(5)
+        ]
+        class Reviewer:
+            def __init__(self):
+                self.reviewed = []
+
+            def extract_json(self, system, prompt):
+                ids = re.findall(r"^ITEM_ID: (.+)$", prompt, re.MULTILINE)
+                self.reviewed.extend(ids)
+                return json.dumps({"decisions": [{
+                    "item_id": item_id, "kind": "method", "source_role": "project_evidence",
+                    "project_admission": True, "uncertain": False, "duplicate_of": None,
+                    "related_project_evidence_ids": [], "related_lock_ids": [],
+                    "reason": "Méthode attestée.",
+                } for item_id in ids]})
+
+        llm = Reviewer()
+        review = GlobalProjectReviewer(
+            llm, GlobalReviewerConfig(max_output_tokens=1450),
+        ).review_cached([], items, [])
+        self.assertEqual(review["status"], "complete", review["error"])
+        self.assertGreater(review["batch_count"], 1)
+        self.assertEqual(review["reconciliation_calls"], 0)
+        self.assertCountEqual(llm.reviewed, [item.item_id for item in items])
+        self.assertEqual([r["evidence_ids"] for r in review["decisions"]],
+                         [[item.evidence.evidence_id] for item in items])
