@@ -121,12 +121,14 @@ class GlobalReasonerLLMAdapter:
         self.client.openai_fallback_models = []
         self.client.openrouter_fallback_models = []
 
-    def fork(self, reasoning_effort: Optional[str] = None) -> "GlobalReasonerLLMAdapter":
+    def fork(self, reasoning_effort: Optional[str] = None, *,
+             background: Optional[bool] = None) -> "GlobalReasonerLLMAdapter":
         """Client propre à un lot : les métadonnées du dernier appel ne se mélangent pas."""
-        config = self.config
-        if reasoning_effort and reasoning_effort != config.reasoning_effort:
-            config = replace(config, reasoning_effort=reasoning_effort)
-        return GlobalReasonerLLMAdapter(config)
+        return GlobalReasonerLLMAdapter(replace(
+            self.config,
+            reasoning_effort=reasoning_effort or self.config.reasoning_effort,
+            background=self.config.background if background is None else background,
+        ))
 
     def extract_json(self, system_prompt: str, user_prompt: str) -> str:
         prompt = (
@@ -143,7 +145,7 @@ class GlobalReasonerLLMAdapter:
             prompt_char_limit=self.config.max_prompt_chars,
             fail_on_truncation=True,
             reasoning_effort=self.config.reasoning_effort,
-            background=self.config.provider == "openai",
+            background=self.config.provider == "openai" and self.config.background,
         )
 
 
@@ -175,7 +177,9 @@ class GlobalFastLLMAdapter:
             prompt_char_limit=self.config.max_prompt_chars,
             fail_on_truncation=True,
             reasoning_effort=self.config.reasoning_effort,
-            background=self.config.provider == "openai",
+            # Les lots d'extraction et leurs réparations sont courts. L'audit
+            # global garde le mode asynchrone pour ses demandes plus longues.
+            background=self.config.provider == "openai" and self.request_name.endswith(":completeness_audit"),
         )
 
 

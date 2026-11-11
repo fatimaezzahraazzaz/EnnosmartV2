@@ -877,19 +877,26 @@ class GlobalProjectReviewer:
 
     def _targeted_reviewer(self) -> "GlobalProjectReviewer":
         """Même relecteur avec le raisonnement prévu pour la relecture ciblée."""
-        effort = str(getattr(self.config, "targeted_reasoning_effort", "") or "").strip()
-        if not effort or effort == self.config.reasoning_effort:
+        effort = self.config.targeted_reasoning_effort or self.config.reasoning_effort
+        if not self.config.background and effort == self.config.reasoning_effort:
             return self
         fork = getattr(self.llm, "fork", None)
         if not callable(fork):
             return self
         try:
-            llm = fork(reasoning_effort=effort)
+            llm = fork(reasoning_effort=effort, background=False)
         except TypeError:
-            return self
+            if effort == self.config.reasoning_effort:
+                return self
+            try:
+                llm = fork(reasoning_effort=effort)
+            except TypeError:
+                return self
         if llm is None:
             return self
-        return GlobalProjectReviewer(llm, replace(self.config, reasoning_effort=effort))
+        return GlobalProjectReviewer(llm, replace(
+            self.config, reasoning_effort=effort, background=False,
+        ))
 
     def review_cached(
         self, chunks, extractions, entities, *, cache_dir=None, corpus_fingerprint="",

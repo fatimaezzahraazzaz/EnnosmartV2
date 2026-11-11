@@ -3,6 +3,7 @@ import re
 import unittest
 from unittest.mock import Mock
 
+from agents.EnnoDiagnostic.V2.ennodiagnostic_v2.completeness_auditor import CompletenessAuditor
 from agents.EnnoDiagnostic.V2.ennodiagnostic_v2.config import GlobalFastPathConfig, GlobalReviewerConfig
 from agents.EnnoDiagnostic.V2.ennodiagnostic_v2.global_fast_path import FastLotReadError, GlobalFastExtractor, build_passages
 from agents.EnnoDiagnostic.V2.ennodiagnostic_v2.global_project_reviewer import GlobalProjectReviewer
@@ -123,3 +124,20 @@ class DiagnosticLatencyRegressionTests(unittest.TestCase):
         self.assertCountEqual(llm.reviewed, [item.item_id for item in items])
         self.assertEqual([r["evidence_ids"] for r in review["decisions"]],
                          [[item.evidence.evidence_id] for item in items])
+
+    def test_lock_repair_keeps_original_lock_references_and_exact_proofs(self):
+        unrelated, source, signal, _ = self.passages
+        facts = [
+            {"kind": "method", "source_role": "project_evidence", "statement": "A" * 9000,
+             "passage_ids": [unrelated.passage_id]},
+            {"kind": "lock", "source_role": "project_evidence", "statement": "Résistance variable",
+             "passage_ids": [source.passage_id]},
+        ]
+        targets = [{"signal_id": "ls1", "passage_ids": [signal.passage_id]}]
+        passages, prompt = CompletenessAuditor._coverage_repair_prompt(
+            self.passages, facts, {}, targets, {"ls1": "missing_lock_coverage_decision"},
+        )
+        self.assertEqual(passages, [source, signal])
+        self.assertIn('"fact_id":"f2"', prompt)
+        self.assertNotIn(facts[0]["statement"], prompt)
+        self.assertIn(signal.text, prompt)

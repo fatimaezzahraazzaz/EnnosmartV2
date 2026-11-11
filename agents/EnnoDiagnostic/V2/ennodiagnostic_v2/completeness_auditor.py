@@ -150,6 +150,24 @@ une incertitude technique. Le LockQualifier décidera du statut, jamais cet audi
 """.strip()
 
 
+LOCK_COVERAGE_REPAIR_SYSTEM = """
+Vérifie uniquement les signaux listés à partir des passages exacts du dossier
+R&D et des verrous validés fournis. Un signal n'est pas automatiquement un verrou.
+N'invente aucune donnée ni identifiant. Pour chaque signal, retourne une décision
+avec son signal_id, les passage_ids du signal et une justification technique.
+Utilise covered_by_existing_lock avec les identifiants existing_lock_ids fournis,
+new_lock_added avec new_lock_ids, ou not_a_lock avec reason_code.
+Utilise une seule liste de références pour chaque décision.
+Pour un nouveau verrou réellement soutenu par les preuves, ajoute uniquement ce
+fait à facts, avec fact_id de forme a1, kind=lock, statement, source_role,
+temporal_status, passage_ids, document_ids et needs_review.
+Pour un verrou déjà ajouté, réutilise son identifiant new_lock_ids fourni.
+Réponds en JSON : {"facts":[],"lock_coverage_decisions":[{"signal_id":"...",
+"decision":"...","passage_ids":[],"existing_lock_ids":[],"new_lock_ids":[],
+"reason_code":"...","reason":"..."}]}.
+""".strip() + "\nValeurs autorisées de reason_code : " + ", ".join(sorted(NOT_LOCK_REASONS))
+
+
 def _duplicate(left: dict, right: dict) -> bool:
     """Conservative equivalence; never compare different semantic categories."""
     if any(left[key] != right[key] for key in ("kind", "source_role", "temporal_status")):
@@ -345,23 +363,10 @@ class CompletenessAuditor:
                     targets = batch_signals if "__unexpected__" in errors else [
                         s for s in batch_signals if s["signal_id"] in errors]
                     target_ids = {s["signal_id"] for s in targets}
-                    # Keep exact neighbouring passages and all referenced LOCK
-                    # proofs; no regeneration of the complete dossier.
-                    wanted = {p for s in targets for p in s["passage_ids"]}
-                    seeds = set(wanted)
-                    for index, passage in enumerate(passages):
-                        if passage.passage_id in seeds:
-                            for neighbour in passages[max(0, index-1):index+2]:
-                                if neighbour.document_id == passage.document_id:
-                                    wanted.add(neighbour.passage_id)
-                    for f in [*initial, *additions_by_id.values()]:
-                        if f["kind"] == "lock":
-                            wanted.update(f["passage_ids"])
-                    repair_passages = [p for p in passages if p.passage_id in wanted]
-                    repair_prompt = self._prompt(repair_passages, initial) + "\nSIGNAUX CIBLES SEULEMENT:\n" + json.dumps(targets, ensure_ascii=False)
-                    repair_prompt += "\nFAITS AJOUTES VALIDES (références new_lock_ids permises):\n" + json.dumps(additions_by_id, ensure_ascii=False)
-                    repair_prompt += "\nERREURS A REPARER:\n" + json.dumps(errors, ensure_ascii=False)
-                    repair_system = AUDIT_SYSTEM + "\nRETRY CIBLE : retourne une décision seulement pour chaque signal de SIGNAUX CIBLES SEULEMENT. Conserve les facts existants ; facts contient seulement d'éventuels nouveaux faits manquants."
+                    repair_passages, repair_prompt = self._coverage_repair_prompt(
+                        passages, initial, additions_by_id, targets, errors,
+                    )
+                    repair_system = LOCK_COVERAGE_REPAIR_SYSTEM
                     if len(repair_prompt) + len(repair_system) + 64 <= self.config.max_prompt_chars:
                         audit["llm_calls"] += 1
                         audit["targeted_retries"] = audit.get("targeted_retries", 0) + 1
@@ -420,6 +425,38 @@ class CompletenessAuditor:
             audit.update({"error": f"{type(exc).__name__}:{exc}", "partial_proposals": proposals})
             print(f"[EnnoDiagnostic][CompletenessAudit] échec isolé: {audit['error']}; extraction initiale conservée", flush=True)
             return [], audit
+
+    @staticmethod
+    def _coverage_repair_prompt(passages, initial, additions_by_id, targets, errors):
+        seeds = {p for signal in targets for p in signal["passage_ids"]}
+        wanted = set(seeds)
+        for index, passage in enumerate(passages):
+            if passage.passage_id in seeds:
+                wanted.update(neighbour.passage_id for neighbour in passages[max(0, index-1):index+2]
+                              if neighbour.document_id == passage.document_id)
+
+        def project_lock(fact):
+            return fact["kind"] == "lock" and fact["source_role"] == "project_evidence"
+
+        existing = [
+            {**fact, "fact_id": f"f{index}"}
+            for index, fact in enumerate(initial, 1) if project_lock(fact)
+        ]
+        added = {key: fact for key, fact in additions_by_id.items() if project_lock(fact)}
+        for fact in [*existing, *added.values()]:
+            wanted.update(fact["passage_ids"])
+
+        repair_passages = [p for p in passages if p.passage_id in wanted]
+        repair_prompt = (
+            "SIGNAUX CIBLES SEULEMENT :\n" + json.dumps(targets, ensure_ascii=False)
+            + "\nERREURS A REPARER :\n" + json.dumps(errors, ensure_ascii=False)
+            + "\nVERROUS INITIAUX VALIDES (existing_lock_ids) :\n"
+            + json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
+            + "\nVERROUS AJOUTES VALIDES (new_lock_ids) :\n"
+            + json.dumps(added, ensure_ascii=False, separators=(",", ":"))
+            + "\n" + _registry_prompt(repair_passages)
+        )
+        return repair_passages, repair_prompt
 
     @staticmethod
     def _index_additions(payload, accepted, index, prefix):

@@ -45,6 +45,7 @@ class GlobalReviewerConfig:
     max_output_tokens: int = 12000
     batch_size: int = 28
     max_workers: int = 6
+    background: bool = True
 
 
 def _int_setting(name: str, default: int) -> int:
