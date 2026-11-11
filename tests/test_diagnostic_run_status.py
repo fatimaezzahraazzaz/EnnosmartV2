@@ -1,43 +1,29 @@
-"""Un diagnostic en cours reste visible et bloque un second lancement, quel que soit le processus."""
+"""Un diagnostic en cours reste visible pour la page, quel que soit le processus de l'API."""
 
-import subprocess
-import sys
-import tempfile
-import textwrap
-import time
+import os
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 from services import diagnostic_reset_service as locks
 
+FAKE_PROJECT = 987654  # aucun projet réel : le verrou consultatif ne touche aucune donnée
+SQLITE_DB = SimpleNamespace(get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="sqlite")))
 
-class DiagnosticRunStatusTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.previous_dir = locks._LOCK_DIR
-        locks._LOCK_DIR = Path(self.tmp.name)
-        self.project = SimpleNamespace(id=987654)
 
-    def tearDown(self):
-        locks._LOCK_DIR = self.previous_dir
-        self.tmp.cleanup()
-
-    def test_status_is_running_only_while_the_diagnostic_runs(self):
+class RunStatusWithoutDatabaseTests(unittest.TestCase):
+    def test_status_follows_the_process_lock(self):
+        project = SimpleNamespace(id=FAKE_PROJECT)
         seen = {}
 
         @locks.exclusive_project_diagnostic
         def run(db, project):
-            seen["during"] = locks.diagnostic_activity(project.id)
+            seen["during"] = locks.diagnostic_activity(db, project.id)
             return "done"
 
-        self.assertFalse(locks.diagnostic_activity(self.project.id)["running"])
-        self.assertEqual(run(None, self.project), "done")
+        self.assertEqual(locks.diagnostic_activity(SQLITE_DB, FAKE_PROJECT), {"running": False})
+        self.assertEqual(run(SQLITE_DB, project), "done")
         self.assertTrue(seen["during"]["running"])
-        if locks.fcntl is not None:
-            self.assertEqual(seen["during"]["operation"], "run")
-            self.assertIn("started_at", seen["during"])
-        self.assertFalse(locks.diagnostic_activity(self.project.id)["running"])
+        self.assertEqual(locks.diagnostic_activity(SQLITE_DB, FAKE_PROJECT), {"running": False})
 
     def test_failed_diagnostic_releases_the_lock(self):
         @locks.exclusive_project_diagnostic
@@ -45,45 +31,40 @@ class DiagnosticRunStatusTests(unittest.TestCase):
             raise ValueError("boom")
 
         with self.assertRaises(ValueError):
-            run(None, self.project)
-        self.assertFalse(locks.diagnostic_activity(self.project.id)["running"])
+            run(SQLITE_DB, SimpleNamespace(id=FAKE_PROJECT))
+        self.assertFalse(locks.diagnostic_activity(SQLITE_DB, FAKE_PROJECT)["running"])
 
-    @unittest.skipIf(locks.fcntl is None, "verrou entre processus disponible seulement sous Linux")
-    def test_second_launch_from_another_process_is_refused(self):
-        holder = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""
-            import sys, time
-            from pathlib import Path
-            from types import SimpleNamespace
-            from services import diagnostic_reset_service as locks
-            locks._LOCK_DIR = Path({self.tmp.name!r})
 
-            @locks.exclusive_project_diagnostic
-            def run(db, project):
-                print("HOLDING", flush=True)
-                time.sleep(30)
+@unittest.skipUnless(
+    os.getenv("ENNOSMART_RUN_STATUS_PG_TEST") == "1"
+    and os.getenv("DATABASE_URL", "").startswith("postgresql"),
+    "nécessite la base PostgreSQL de l'API",
+)
+class RunStatusAcrossProcessesTests(unittest.TestCase):
+    def setUp(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
 
-            run(None, SimpleNamespace(id={self.project.id}))
-        """)], stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertEqual(holder.stdout.readline().strip(), "HOLDING")
-            status = locks.diagnostic_activity(self.project.id)
+        self.engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+        self.sessions = [Session(self.engine) for _ in range(3)]
+
+    def tearDown(self):
+        for session in self.sessions:
+            session.close()
+        self.engine.dispose()
+
+    def test_lock_held_by_another_connection_is_reported_and_blocks_a_second_launch(self):
+        holder, reader, second = self.sessions
+        self.assertFalse(locks.diagnostic_activity(reader, FAKE_PROJECT)["running"])
+        with locks._database_project_lock(holder, FAKE_PROJECT) as acquired:
+            self.assertTrue(acquired)
+            status = locks.diagnostic_activity(reader, FAKE_PROJECT)
             self.assertTrue(status["running"])
-            self.assertEqual(status["operation"], "run")
-
-            @locks.exclusive_project_diagnostic
-            def second(db, project):
-                self.fail("un second diagnostic a démarré")
-
-            with self.assertRaisesRegex(RuntimeError, "déjà en cours"):
-                second(None, self.project)
-        finally:
-            holder.kill()
-            holder.wait()
-        # Le système libère le verrou d'un processus arrêté net.
-        deadline = time.monotonic() + 5
-        while locks.diagnostic_activity(self.project.id)["running"] and time.monotonic() < deadline:
-            time.sleep(0.1)
-        self.assertFalse(locks.diagnostic_activity(self.project.id)["running"])
+            self.assertIn("started_at", status)
+            self.assertLess(status["elapsed_seconds"], 60)
+            with locks._database_project_lock(second, FAKE_PROJECT) as second_acquired:
+                self.assertFalse(second_acquired)
+        self.assertFalse(locks.diagnostic_activity(reader, FAKE_PROJECT)["running"])
 
 
 if __name__ == "__main__":

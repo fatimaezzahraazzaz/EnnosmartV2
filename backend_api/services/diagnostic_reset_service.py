@@ -1,98 +1,108 @@
 """A new diagnostic starts with no previous agent runs for that project."""
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
 from threading import Lock
-import json
-import os
 import shutil
-import tempfile
-import time
 
-from sqlalchemy import MetaData, Table, delete, inspect, or_, select
+from sqlalchemy import MetaData, Table, delete, inspect, or_, select, text
 from db.models import Article, DiagnosticRun, ProjectArtifact, ScholarRun, Verrou
-
-try:
-    import fcntl
-except ImportError:  # Windows en local : seul le verrou du processus s'applique.
-    fcntl = None
 
 _project_locks = {}
 _locks_guard = Lock()
-BUSY_MESSAGE = 'Une préparation ou un diagnostic est déjà en cours pour ce projet.'
-# Fichiers partagés par tous les processus de l'API dans le même conteneur. Le
-# système libère le verrou si un processus s'arrête en plein diagnostic.
-_LOCK_DIR = Path(os.getenv('ENNOSMART_DIAGNOSTIC_LOCK_DIR') or Path(tempfile.gettempdir()) / 'ennosmart-diagnostic-locks')
+_ALREADY_RUNNING = 'Une préparation ou un diagnostic est déjà en cours pour ce projet.'
+# Espace de noms des verrous consultatifs PostgreSQL : préparation + diagnostic d'un projet.
+_ADVISORY_NAMESPACE = 42017
 
 
-def _lock_path(project_id) -> Path:
-    return _LOCK_DIR / f'project-{int(project_id)}.lock'
+@contextmanager
+def _database_project_lock(db, project_id):
+    """Verrou commun à tous les processus de l'API (uvicorn --workers 2).
 
-
-def _acquire_process_lock(project_id, operation: str):
-    if fcntl is None:
-        return None
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(_lock_path(project_id), 'a+', encoding='utf-8')
-    for attempt in range(5):
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            # Une simple lecture d'état peut tenir le verrou un instant.
-            if attempt == 4:
-                handle.close()
-                raise RuntimeError(BUSY_MESSAGE)
-            time.sleep(0.1)
-    handle.seek(0)
-    handle.truncate()
-    handle.write(json.dumps({
-        'operation': operation,
-        'started_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-        'pid': os.getpid(),
-    }))
-    handle.flush()
-    return handle
-
-
-def _release_process_lock(handle) -> None:
+    Le verrou Python ne protège qu'un processus : le 10/11, un second lancement
+    arrivé sur l'autre worker a remis à zéro un diagnostic en cours. Le verrou
+    consultatif PostgreSQL est posé sur une connexion dédiée et disparaît avec
+    elle si le processus s'arrête. Hors PostgreSQL (tests SQLite) : pas de verrou.
+    """
     try:
-        handle.seek(0)
-        handle.truncate()
-        handle.flush()
+        bind = db.get_bind()
+    except Exception:
+        bind = None
+    if bind is None or getattr(getattr(bind, 'dialect', None), 'name', '') != 'postgresql':
+        yield True
+        return
+    params = {'ns': _ADVISORY_NAMESPACE, 'pid': int(project_id)}
+    try:
+        connection = bind.connect().execution_options(isolation_level='AUTOCOMMIT')
+    except Exception as exc:
+        print(f'[EnnoDiagnostic][LOCK] verrou base indisponible ({type(exc).__name__}) ; '
+              'verrou local seul', flush=True)
+        yield True
+        return
+    try:
+        acquired = bool(connection.execute(
+            text('select pg_try_advisory_lock(:ns, :pid)'), params,
+        ).scalar())
+    except Exception as exc:
+        connection.close()
+        print(f'[EnnoDiagnostic][LOCK] verrou base indisponible ({type(exc).__name__}) ; '
+              'verrou local seul', flush=True)
+        yield True
+        return
+    try:
+        yield acquired
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
-        handle.close()
+        if acquired:
+            try:
+                connection.execute(text('select pg_advisory_unlock(:ns, :pid)'), params)
+            except Exception:
+                # Connexion fermée côté serveur : le verrou part avec elle.
+                connection.invalidate()
+        connection.close()
 
 
-def diagnostic_activity(project_id) -> dict:
-    """Indique si une préparation ou un diagnostic tourne pour ce projet, dans n'importe quel processus."""
+_ACTIVE_LOCK_SQL = text(
+    "select a.query_start from pg_locks l "
+    "left join pg_stat_activity a on a.pid = l.pid "
+    "where l.locktype = 'advisory' and l.granted "
+    "and l.classid = :ns and l.objid = :pid and l.objsubid = 2 "
+    "and l.database = (select oid from pg_database where datname = current_database()) "
+    "limit 1"
+)
+
+
+def diagnostic_activity(db, project_id) -> dict:
+    """Indique si une préparation ou un diagnostic tourne pour ce projet, dans n'importe quel processus.
+
+    Lit le verrou consultatif posé par _database_project_lock. La connexion qui le
+    tient reste inactive après pg_try_advisory_lock : son query_start donne l'heure
+    du lancement.
+    """
     with _locks_guard:
         local = _project_locks.get(int(project_id))
-    local_running = bool(local is not None and local.locked())
-    path = _lock_path(project_id)
-    if fcntl is None or not path.exists():
-        return {'running': local_running}
-    with open(path, 'a+', encoding='utf-8') as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            handle.seek(0)
-            try:
-                info = json.loads(handle.read() or '{}')
-            except ValueError:
-                info = {}
-            status = {'running': True}
-            if isinstance(info, dict):
-                status.update({key: info[key] for key in ('operation', 'started_at') if key in info})
-                try:
-                    started = datetime.fromisoformat(str(info.get('started_at')))
-                    status['elapsed_seconds'] = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
-                except (TypeError, ValueError):
-                    pass
-            return status
-        fcntl.flock(handle, fcntl.LOCK_UN)
-    return {'running': local_running}
+    status = {'running': bool(local is not None and local.locked())}
+    try:
+        bind = db.get_bind()
+    except Exception:
+        bind = None
+    if bind is None or getattr(getattr(bind, 'dialect', None), 'name', '') != 'postgresql':
+        return status
+    try:
+        row = db.execute(_ACTIVE_LOCK_SQL, {'ns': _ADVISORY_NAMESPACE, 'pid': int(project_id)}).first()
+    except Exception as exc:
+        db.rollback()
+        print(f'[EnnoDiagnostic][LOCK] état du verrou base illisible ({type(exc).__name__})', flush=True)
+        return status
+    if row is not None:
+        status['running'] = True
+        started = row[0]
+        if isinstance(started, datetime):
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            status['started_at'] = started.isoformat(timespec='seconds')
+            status['elapsed_seconds'] = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+    return status
 
 
 def exclusive_project_diagnostic(function):
@@ -102,14 +112,14 @@ def exclusive_project_diagnostic(function):
         with _locks_guard:
             lock = _project_locks.setdefault(int(project.id), Lock())
         if not lock.acquire(blocking=False):
-            raise RuntimeError(BUSY_MESSAGE)
+            raise RuntimeError(_ALREADY_RUNNING)
         try:
-            handle = _acquire_process_lock(project.id, function.__name__)
-            try:
+            with _database_project_lock(db, project.id) as acquired:
+                if not acquired:
+                    print(f'[EnnoDiagnostic][LOCK] project_id={project.id} : déjà en cours '
+                          'dans un autre processus de l\'API', flush=True)
+                    raise RuntimeError(_ALREADY_RUNNING)
                 return function(db, project, *args, **kwargs)
-            finally:
-                if handle is not None:
-                    _release_process_lock(handle)
         finally:
             lock.release()
     return wrapped

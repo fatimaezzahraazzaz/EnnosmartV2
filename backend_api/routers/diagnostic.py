@@ -2293,7 +2293,7 @@ def get_diagnostic_run_status(
     from services.diagnostic_reset_service import diagnostic_activity
 
     project = get_project_for_user(db, project_id, current_user)
-    return diagnostic_activity(project.id)
+    return diagnostic_activity(db, project.id)
 
 
 @router.get("/projects/{project_id}/diagnostic/preparation-status")
