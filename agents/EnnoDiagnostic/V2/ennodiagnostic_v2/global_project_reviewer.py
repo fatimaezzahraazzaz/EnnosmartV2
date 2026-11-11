@@ -17,7 +17,6 @@ from typing import Iterable
 from pathlib import Path
 
 from .config import GlobalReviewerConfig
-from .execution import diagnostic_workers
 from .schemas import CanonicalEntity, Chunk, ExtractionItem
 from .semantic_extractor import LLMClientProtocol, parse_json_payload
 
@@ -35,7 +34,7 @@ preuves autorisées pour leurs décisions. Un passage d'article demeure literatu
 même si sa limite ressemble à un verrou ou à un résultat du projet.
 
 Pour CHAQUE item_id du lot, rends exactement une décision, sans ID supplémentaire :
-{"decisions":[{"item_id":"...","original_item_ids":["..."],"evidence_ids":["..."],
+{"decisions":[{"item_id":"...",
 "source_role":"project_evidence|literature|admin|context|unknown",
 "kind":"objective|lock|method|demarche|parameter|metric|result",
 "project_admission":true,"uncertain":false,"duplicate_of":null,
@@ -50,8 +49,8 @@ N'admets dans le projet que les faits explicitement attribuables à ce projet.
 Si l'attribution ou la catégorie est douteuse, uncertain=true et project_admission=false.
 project_admission indique l'attribution, indépendamment d'un éventuel doublon :
 un doublon projet conserve project_admission=true et référence son équivalent.
-Ne crée aucun fait ni preuve. Pour chaque décision, original_item_ids doit
-contenir seulement son item_id et evidence_ids seulement son evidence_id source.
+Ne crée aucun fait ni preuve. Réponds avec item_id et les champs ci-dessus.
+Le programme rattache l'identité et la preuve exactes du candidat à cette décision.
 N'invente ni citation, ni document. duplicate_of ne peut désigner qu'un autre item_id de
 la liste des item_id qui exprime réellement le même fait ; sinon null. Pour les candidats lock,
 la décision est seulement OBSERVATOIRE : identifie éventuellement les preuves
@@ -386,48 +385,52 @@ class GlobalProjectReviewer:
             if item.item_id not in normalized:
                 errors.setdefault(item.item_id, f"missing_decision:{item.item_id}")
         if errors:
-            # Les décisions valides du lot sont conservées. Seuls les items
-            # invalides sont renvoyés avec leur citation exacte.
-            for item_id, first_error in list(errors.items()):
-                item = by_id[item_id]
-                retry_entry = None
-                retry_prompt = self._initial_prompt(
-                    "REPRISE CIBLEE. Corrige la décision invalide : " + first_error + "\n\n",
-                    [item],
-                )
-                if not _fits(retry_prompt, system, 1, self.config):
-                    retry_prompt = self._initial_prompt("", [item])
-                    if not _fits(retry_prompt, system, 1, self.config):
-                        raise ValueError(f"targeted_retry_exceeds_budget:{item_id}")
-                try:
-                    retry_raw = self.llm.extract_json(system, retry_prompt)
-                    retry_entry = {
-                        "stage": "targeted_retry", "target_item_ids": [item_id],
-                        "response": retry_raw, "validation_errors": {},
-                    }
-                    self._review_audit.append(retry_entry)
-                    retry_payload = parse_json_payload(retry_raw)
-                    retry_rows = retry_payload.get("decisions") if isinstance(retry_payload, dict) else None
-                    if (
-                        not isinstance(retry_rows, list)
-                        or len(retry_rows) != 1
-                        or not isinstance(retry_rows[0], dict)
-                        or retry_rows[0].get("item_id") != item_id
-                    ):
-                        raise ValueError(f"invalid_targeted_item_ids:{item_id}")
-                    normalized[item_id] = self._normalize_decision(
-                        retry_rows[0], item, by_id, original_entities_by_item,
-                        evidence_to_item,
-                    )
-                except Exception as exc:
-                    if retry_entry is not None:
+            # Une seule demande répare les décisions invalides de ce lot.
+            missing = [by_id[item_id] for item_id in errors]
+            feedback = "REPRISE CIBLEE, une décision pour chaque candidat :\n" + "\n".join(
+                f"{item_id}: {reason}" for item_id, reason in errors.items()
+            )
+            retry_prompt = self._initial_prompt(feedback, missing)
+            retry_entry = {
+                "stage": "targeted_retry", "target_item_ids": list(errors),
+                "validation_errors": {},
+            }
+            self._review_audit.append(retry_entry)
+            try:
+                if not _fits(retry_prompt, system, len(missing), self.config):
+                    retry_prompt = self._initial_prompt("Reprise des décisions invalides.", missing)
+                if not _fits(retry_prompt, system, len(missing), self.config):
+                    raise ValueError("targeted_retry_exceeds_budget")
+                retry_raw = self.llm.extract_json(system, retry_prompt)
+                retry_entry["response"] = retry_raw
+                retry_payload = parse_json_payload(retry_raw)
+                retry_rows = retry_payload.get("decisions") if isinstance(retry_payload, dict) else None
+                if not isinstance(retry_rows, list):
+                    raise ValueError("invalid_targeted_decisions")
+                returned = defaultdict(list)
+                for row in retry_rows:
+                    if isinstance(row, dict) and isinstance(row.get("item_id"), str):
+                        returned[row["item_id"]].append(row)
+                for item in missing:
+                    item_id = item.item_id
+                    try:
+                        matches = returned[item_id]
+                        if len(matches) != 1:
+                            raise ValueError("missing_or_duplicate_targeted_decision")
+                        normalized[item_id] = self._normalize_decision(
+                            matches[0], item, by_id, original_entities_by_item, evidence_to_item,
+                        )
+                    except ValueError as exc:
                         retry_entry["validation_errors"][item_id] = str(exc)
+            except (RuntimeError, ValueError, TypeError) as exc:
+                retry_entry["error"] = f"{type(exc).__name__}:{exc}"
+            for item in missing:
+                item_id = item.item_id
+                if item_id not in normalized:
+                    retry_error = retry_entry["validation_errors"].get(item_id) or retry_entry.get("error", "")
                     normalized[item_id] = self._needs_review_decision(
-                        item, original_entities_by_item,
-                        f"{first_error}; retry: {type(exc).__name__}:{exc}",
+                        item, original_entities_by_item, f"{errors[item_id]}; retry: {retry_error}",
                     )
-                # Une indisponibilité de l'API est systémique : le fallback
-                # historique conserve alors les réponses déjà reçues dans l'audit.
         return normalized
 
     @staticmethod
@@ -460,9 +463,9 @@ class GlobalProjectReviewer:
             raise ValueError(f"invalid_role_or_kind:{item_id}")
         if not isinstance(row.get("project_admission"), bool) or not isinstance(row.get("uncertain"), bool):
             raise ValueError(f"invalid_admission_or_uncertainty:{item_id}")
-        if row.get("original_item_ids") != [item_id]:
+        if row.get("original_item_ids", [item_id]) != [item_id]:
             raise ValueError(f"invalid_original_item_ids:{item_id}")
-        if row.get("evidence_ids") != [item.evidence.evidence_id]:
+        if row.get("evidence_ids", [item.evidence.evidence_id]) != [item.evidence.evidence_id]:
             raise ValueError(f"invalid_evidence_ids:{item_id}")
         if "quote" in row and row["quote"] != item.evidence.quote:
             raise ValueError(f"invented_quote:{item_id}")
@@ -571,7 +574,7 @@ class GlobalProjectReviewer:
                 ))
             return groups
 
-        workers = min(diagnostic_workers(), len(planned))
+        workers = min(self.config.max_workers, len(planned))
         fork = getattr(self.llm, "fork", None)
         if workers <= 1 or not callable(fork):
             return sequential()

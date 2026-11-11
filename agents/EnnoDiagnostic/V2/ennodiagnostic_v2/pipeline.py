@@ -13,7 +13,7 @@ from .review import build_review_queue
 from .schemas import DocumentInput, PipelineResult
 from .semantic_extractor import LLMClientProtocol, SemanticExtractor
 from .global_project_reviewer import GlobalProjectReviewer
-from .global_fast_path import GlobalFastExtractor, build_passages
+from .global_fast_path import FastLotReadError, GlobalFastExtractor, build_passages
 from .diagnostic_debug import DiagnosticDebug
 
 
@@ -132,6 +132,11 @@ class EnnoDiagnosticV2:
                     f"{fast_meta.get('llm_calls', 0)} appel(s) LLM",
                     flush=True,
                 )
+            except FastLotReadError as exc:
+                raise RuntimeError(
+                    "L'analyse d'une partie du dossier a échoué après reprise ciblée. "
+                    "Les lots vérifiés en cache seront réutilisés à la prochaine tentative."
+                ) from exc
             except Exception as exc:
                 fast_meta = {"status": "fallback", "error": f"{type(exc).__name__}:{exc}"}
                 print(f"[EnnoDiagnostic][FastPath] échec: {fast_meta['error']}; chemin historique", flush=True)

@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from uuid import uuid4
 
 
@@ -14,10 +15,11 @@ class DiagnosticDebug:
         self.directory.mkdir(parents=True, exist_ok=False)
         self.path = self.directory / "trace.jsonl"
         self.sequence = 0
+        self._lock = Lock()
 
     def record(self, stage, value):
-        self.sequence += 1
-        with self.path.open("a", encoding="utf-8") as handle:
+        with self._lock, self.path.open("a", encoding="utf-8") as handle:
+            self.sequence += 1
             handle.write(json.dumps({"sequence": self.sequence, "stage": stage,
                 "time": datetime.now(timezone.utc).isoformat(), "data": value},
                 ensure_ascii=False, default=str) + "\n")

@@ -28,6 +28,10 @@ KINDS = {"objective", "lock", "method", "demarche", "parameter", "metric", "resu
 ROLES = {"project_evidence", "literature", "context", "admin"}
 TEMPORAL = {"planned", "in_progress", "performed", "unclear"}
 
+class FastLotReadError(RuntimeError):
+    """La lecture d’un lot a échoué après une reprise locale."""
+
+
 GLOBAL_SYSTEM = """
 Analyse ENSEMBLE tous les documents bruts du dossier R&D. Ils ne sont pas un CIR final.
 Chaque ligne P du registre est un passage exact identifié par passage_id, document_id
@@ -343,7 +347,7 @@ class GlobalFastExtractor:
         estimated_output = max(12000, len(passages) * 140)
         # The output reservation includes reasoning tokens on GPT-5.
         mode = "global" if (
-            prompt_chars <= self.config.max_prompt_chars
+            prompt_chars <= min(self.config.max_prompt_chars, self.config.target_lot_chars)
             and input_tokens + output_tokens + 4096 < context_window
             and output_tokens >= estimated_output
         ) else "multi_lot"
@@ -644,12 +648,29 @@ class GlobalFastExtractor:
             calls += 1
         return rows, calls
 
+    def _read_lot(self, passages: list[Passage], *, split_on_failure: bool = True):
+        try:
+            return self._covered_call(passages)
+        except (ValueError, RuntimeError) as exc:
+            if not split_on_failure or len(passages) <= 1:
+                raise FastLotReadError(
+                    f"Lecture incomplète d'un lot de {len(passages)} passages."
+                ) from exc
+            midpoint = len(passages) // 2
+            print(f"[EnnoDiagnostic][FastPath] reprise du seul lot en échec ({len(passages)} passages)", flush=True)
+            left, left_calls = self._read_lot(passages[:midpoint], split_on_failure=False)
+            right, right_calls = self._read_lot(passages[midpoint:], split_on_failure=False)
+            return left + right, 1 + left_calls + right_calls
+
     def _lots(self, passages: list[Passage]) -> list[list[Passage]]:
         """Équilibre la charge sans disperser les passages voisins."""
         if not passages:
             return []
         output_tokens, context_window = self._capacity()
-        max_chars = min(self.config.max_prompt_chars, 3 * (context_window - output_tokens - 4097))
+        max_chars = min(
+            self.config.target_lot_chars, self.config.max_prompt_chars,
+            3 * (context_window - output_tokens - 4097),
+        )
         max_chars -= len(COVERAGE_SYSTEM) + 64
         max_count = max(1, output_tokens // 140)
         # Compter l'en-tête par passage donne une borne haute du registre réel.
@@ -677,6 +698,11 @@ class GlobalFastExtractor:
             remaining -= size
         return lots
 
+    def _validated_lot(self, passages, by_passage):
+        rows, calls = self._read_lot(passages)
+        checked, retries = self._validated_rows(rows, by_passage)
+        return checked, calls + retries, self._rejected, self._generation_audit
+
     def _multi_lot(self, passages: list[Passage], by_passage: dict[str, Passage],
                    preflight: dict, fingerprint: str) -> tuple[list[dict], int, int, str, int]:
         lots = self._lots(passages)
@@ -684,6 +710,7 @@ class GlobalFastExtractor:
         retries = 0
         cache_hits = 0
         errors = []
+        fork = getattr(self.llm, "fork", None)
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
             pending = {}
             for index, lot in enumerate(lots):
@@ -694,20 +721,34 @@ class GlobalFastExtractor:
                     results[index] = cached
                     cache_hits += 1
                     continue
-                pending[pool.submit(self._covered_call, lot)] = (index, key, local)
+                worker = None
+                if callable(fork):
+                    worker = GlobalFastExtractor(fork(), self.config)
+                    worker.debug_sink = self.debug_sink
+                    future = pool.submit(worker._validated_lot, lot, local)
+                else:
+                    future = pool.submit(self._read_lot, lot)
+                pending[future] = (index, key, local, worker is not None)
             print(f"[EnnoDiagnostic][FastPath] lots={len(lots)} réutilisés={cache_hits}", flush=True)
             for future in as_completed(pending):
-                index, key, local = pending[future]
+                index, key, local, validated = pending[future]
                 try:
-                    rows, call_count = future.result()
+                    if validated:
+                        checked, call_count, rejected, audit = future.result()
+                        self._rejected.extend(rejected)
+                        self._generation_audit.extend(audit)
+                    else:
+                        rows, call_count = future.result()
+                        rejected_before = len(self._rejected)
+                        checked, count = self._validated_rows(rows, local)
+                        rejected = self._rejected[rejected_before:]
+                        call_count += count
                 except Exception as exc:
                     errors.append(exc)
                     continue
-                rejected_before = len(self._rejected)
-                checked, count = self._validated_rows(rows, local)
                 results[index] = checked
-                retries += count + call_count - 1
-                if len(self._rejected) == rejected_before:
+                retries += call_count - 1
+                if not rejected:
                     self._write_cache(key, checked)
                 print(f"[EnnoDiagnostic][FastPath] lot={index + 1}/{len(lots)} validé faits={len(checked)}", flush=True)
         if errors:
@@ -801,7 +842,7 @@ class GlobalFastExtractor:
         reconciliation_status = "not_needed"
         lot_cache_hits = 0
         if preflight["mode"] == "global":
-            rows, coverage_calls = self._covered_call(passages)
+            rows, coverage_calls = self._read_lot(passages)
             checked, retries = self._validated_rows(rows, by_passage)
             calls = coverage_calls + retries
             batches = 1

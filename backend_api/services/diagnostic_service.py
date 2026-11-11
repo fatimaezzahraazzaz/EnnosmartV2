@@ -734,6 +734,7 @@ def _prepare_ennodiagnostic_v2_sources(
     ensure_ennosmart_imports()
 
     from modules.NLP.document_loader import load_documents
+    from modules.extraction.text.pdf_ocr import parallel_tesseract_pages
     from modules.RAG.full_document_corpus import persist_full_documents_for_chat
     from services.diagnostic_reset_service import reset_previous_agent_runs
 
@@ -783,14 +784,15 @@ def _prepare_ennodiagnostic_v2_sources(
         f"[EnnoDiagnostic V2][2/4] Extraction fulltext de {len(raw_paths)} document(s)",
         flush=True,
     )
-    documents = load_documents(
-        raw_paths,
-        use_ennosmart_extraction=True,
-        include_cir_final=False,
-        metadata_by_path=_diagnostic_document_metadata(ps, selected_documents),
-        vision_mode="text_only",
-        formula_mode=os.getenv("ENNOSMART_DIAGNOSTIC_FORMULA_MODE", "fast"),
-    )
+    with parallel_tesseract_pages(4):
+        documents = load_documents(
+            raw_paths,
+            use_ennosmart_extraction=True,
+            include_cir_final=False,
+            metadata_by_path=_diagnostic_document_metadata(ps, selected_documents),
+            vision_mode="text_only",
+            formula_mode=os.getenv("ENNOSMART_DIAGNOSTIC_FORMULA_MODE", "fast"),
+        )
     if not documents:
         raise RuntimeError("Aucun texte exploitable extrait des documents bruts.")
 

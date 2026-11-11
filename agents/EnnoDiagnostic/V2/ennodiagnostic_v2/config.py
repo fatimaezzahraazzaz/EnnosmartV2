@@ -44,6 +44,7 @@ class GlobalReviewerConfig:
     max_prompt_chars: int = 110000
     max_output_tokens: int = 12000
     batch_size: int = 28
+    max_workers: int = 6
 
 
 def _int_setting(name: str, default: int) -> int:
@@ -76,4 +77,5 @@ class GlobalFastPathConfig:
     max_output_tokens: int = 64000
     context_window_tokens: int = 400000
     passage_max_chars: int = 650
-    max_workers: int = 3
+    target_lot_chars: int = 42000
+    max_workers: int = 6

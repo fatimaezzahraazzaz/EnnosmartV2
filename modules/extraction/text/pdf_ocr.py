@@ -25,6 +25,9 @@ import os
 import re
 import shutil
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from importlib import metadata
@@ -32,6 +35,16 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+_TESSERACT_PAGE_WORKERS = ContextVar("tesseract_page_workers", default=1)
+
+
+@contextmanager
+def parallel_tesseract_pages(workers: int):
+    token = _TESSERACT_PAGE_WORKERS.set(max(1, workers))
+    try:
+        yield
+    finally:
+        _TESSERACT_PAGE_WORKERS.reset(token)
 
 try:
     import torch
@@ -1496,6 +1509,37 @@ def _build_tags(result: OCRResult) -> list[str]:
 
 # ── Point d'entrée principal ──────────────────────────────────────────────────
 
+def _process_tesseract_pages(path: Path, selected_pages: list[int], result: OCRResult) -> None:
+    workers = min(_TESSERACT_PAGE_WORKERS.get(), len(selected_pages))
+    engine = OCREngine.TESSERACT
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start in range(0, len(selected_pages), workers):
+            rendered = []
+            try:
+                # Le rendu PyMuPDF reste séquentiel. Seul Tesseract traite
+                # en parallèle les images indépendantes déjà rendues.
+                for page_number in selected_pages[start : start + workers]:
+                    try:
+                        image = _render_pdf_page(path, page_number)
+                        rendered.append((page_number, image))
+                        result.pages_processed.append(page_number)
+                    except Exception as exc:
+                        _record_page_error(result, page_number, engine, exc)
+                pending = [
+                    (page_number, pool.submit(_process_single_page, image, page_number, engine))
+                    for page_number, image in rendered
+                ]
+                for page_number, future in pending:
+                    try:
+                        _record_page_result(result, future.result())
+                    except Exception as exc:
+                        _record_page_error(result, page_number, engine, exc)
+            finally:
+                for _, image in rendered:
+                    image.close()
+            gc.collect()
+
+
 def extract_pdf_ocr(
     file_path: str | Path,
     target_pages: Optional[list[int]] = None,
@@ -1629,24 +1673,7 @@ def extract_pdf_ocr(
                 except Exception:
                     pass
     else:
-        for page_number in selected_pages:
-            image = None
-            try:
-                image = _render_pdf_page(path, page_number)
-                result.pages_processed.append(page_number)
-                _record_page_result(
-                    result,
-                    _process_single_page(image, page_number, engine),
-                )
-            except Exception as exc:
-                _record_page_error(result, page_number, engine, exc)
-            finally:
-                if image is not None:
-                    try:
-                        image.close()
-                    except Exception:
-                        pass
-                gc.collect()
+        _process_tesseract_pages(path, selected_pages, result)
 
     page_engines = {page.engine_used for page in result.pages}
     if len(page_engines) > 1:

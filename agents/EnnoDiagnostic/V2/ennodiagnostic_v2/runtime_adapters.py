@@ -160,6 +160,9 @@ class GlobalFastLLMAdapter:
         self.client.openai_fallback_models = []
         self.client.openrouter_fallback_models = []
 
+    def fork(self) -> "GlobalFastLLMAdapter":
+        return GlobalFastLLMAdapter(self.config, request_name=self.request_name)
+
     def extract_json(self, system_prompt: str, user_prompt: str) -> str:
         return self.client.generate(
             prompt="INSTRUCTIONS SPECIFIQUES\n" + system_prompt.strip()
