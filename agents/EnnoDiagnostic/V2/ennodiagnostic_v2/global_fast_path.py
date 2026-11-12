@@ -175,6 +175,16 @@ Pour suspect_project_context, réponds précisément à : project_evidence ou co
 Un travail prévu appartenant au projet est project_evidence + planned, sans
 inventer de résultat réalisé. Si tu maintiens context, fournis provenance_reason
 expliquant l'attribution extérieure/background ; en cas de doute needs_review=true.
+Pour uncertain_fact, sépare deux questions indépendantes.
+1) Provenance : le passage rapporte-t-il un travail, un essai ou une observation
+du projet lui-même (fiche d'essai, bilan, compte rendu ou tableau de résultats du
+projet) ? Alors source_role=project_evidence, même si l'observation est difficile
+à rattacher à une formulation ou à une variante précise. Un produit, un résultat
+ou une connaissance d'un tiers (concurrent, fournisseur, littérature) n'est pas
+project_evidence. Donne toujours provenance_reason : une phrase qui cite l'élément
+du passage justifiant cette provenance.
+2) Interprétation : garde needs_review=true si le sens, la portée ou la variante
+concernée restent douteux ; ce doute ne change pas la provenance.
 """.strip()
 
 COVERAGE_SYSTEM = GLOBAL_SYSTEM + "\nPasse ciblée : examine exclusivement les passages fournis ; confirme tous leurs IDs dans reviewed_passage_ids."
@@ -297,6 +307,36 @@ def _literature_marker(passage: Passage) -> bool:
     return bool(re.search(r"etat de l.art|bibliograph|litterature|travaux existants|related work|state of the art", heading))
 
 
+_EXTERNAL_SOURCE = re.compile(
+    r"concurren|competit|benchmark|\bveille\b|etat de l.art|state of the art|bibliograph|litterature|related work")
+
+
+def _external_source_marker(passage: Passage) -> bool:
+    """Document de veille, concurrence, benchmark ou état de l'art (d'après son nom).
+
+    Mesure du 12/11 : sans ce garde-fou, des faits du « RECAPITULATIF FILMOGENE
+    HUILEUX CONCURRENCE » étaient confirmés comme preuves du projet. Le titre de
+    section n'est pas utilisé : une section « Concurrents » d'une fiche d'essai du
+    projet contient aussi ses propres décisions (abandon des essais à 50 % d'ISDA).
+    Une section d'état de l'art reste écartée par _literature_marker.
+    """
+    return bool(_EXTERNAL_SOURCE.search(_fold(passage.document_name)))
+
+
+def _carry_provenance(source: dict, target: dict) -> dict:
+    """Reporte une provenance projet confirmée par la relecture ciblée (cache, réconciliation).
+
+    Jamais tirée d'une réponse brute du modèle : seule la relecture d'un verrou
+    incertain la pose. Elle ne survit que si le fait reste un verrou du projet
+    avec sa justification.
+    """
+    if (isinstance(source, dict) and source.get("provenance_confirmed") is True
+            and target.get("kind") == "lock" and target.get("source_role") == "project_evidence"
+            and target.get("provenance_reason")):
+        target["provenance_confirmed"] = True
+    return target
+
+
 class GlobalFastExtractor:
     def __init__(self, llm: LLMClientProtocol, config: GlobalFastPathConfig, cache_dir: Path | None = None,
                  *, completeness_auditor=None, defer_uncertain_review: bool = False):
@@ -390,8 +430,8 @@ class GlobalFastExtractor:
             rows = payload["facts"]
             if not isinstance(rows, list):
                 return None
-            validated = [self._validate(row, by_passage,
-                provenance_reviewed=bool(row.get("provenance_repaired") and row.get("provenance_reason"))) for row in rows]
+            validated = [_carry_provenance(row, self._validate(row, by_passage,
+                provenance_reviewed=bool(row.get("provenance_repaired") and row.get("provenance_reason")))) for row in rows]
             record(self, "fast.cache_read", {"fingerprint": fingerprint,
                 "facts": validated, "original_debug_reference": payload.get("debug_reference")})
             return validated
@@ -544,6 +584,13 @@ class GlobalFastExtractor:
                             isinstance(proposed.get("provenance_reason"), str) and
                             bool(proposed["provenance_reason"].strip()))
                         normalized = self._validate(proposed, by_passage, provenance_reviewed=reviewed)
+                        # Verrou incertain relu : la provenance projet est confirmée
+                        # séparément du doute d'interprétation, qui reste à revoir.
+                        if (_error == "uncertain_fact" and normalized["kind"] == "lock"
+                                and normalized["source_role"] == "project_evidence"
+                                and normalized.get("provenance_reason")
+                                and not any(_external_source_marker(by_passage[p]) for p in normalized["passage_ids"])):
+                            normalized["provenance_confirmed"] = True
                         if set(normalized["passage_ids"]).issubset({p.passage_id for p in known}):
                             fixed[index] = normalized
                     except (ValueError, TypeError, KeyError):
@@ -772,7 +819,8 @@ class GlobalFastExtractor:
         # du pipeline peut les réunir même si cette revue supplémentaire ne tient pas.
         indexed = [{"fact_id": f"f{i+1}", **row} for i, row in enumerate(provisional)]
         used = [by_passage[p] for p in dict.fromkeys(p for row in indexed for p in row["passage_ids"])]
-        prompt = "FAITS PROVISOIRES:\n" + json.dumps(indexed, ensure_ascii=False, separators=(",", ":")) + "\n" + _registry_prompt(used)
+        shown = [{k: v for k, v in row.items() if k != "provenance_confirmed"} for row in indexed]
+        prompt = "FAITS PROVISOIRES:\n" + json.dumps(shown, ensure_ascii=False, separators=(",", ":")) + "\n" + _registry_prompt(used)
         prompt_chars = len(RECONCILE_SYSTEM) + len(prompt) + 64
         output_tokens = preflight["reserved_output_tokens"]
         if (
@@ -803,7 +851,9 @@ class GlobalFastExtractor:
             checked = self._validate(row, by_passage)
             if set(checked["passage_ids"]) != set(original["passage_ids"]):
                 raise ValueError("reconciliation_changed_evidence")
-            final.append(checked)
+            if checked.get("provenance_reason") is None and original.get("provenance_reason"):
+                checked["provenance_reason"] = original["provenance_reason"]
+            final.append(_carry_provenance(original, checked))
         return final
 
     @staticmethod
@@ -812,7 +862,11 @@ class GlobalFastExtractor:
         for index, row in enumerate(rows, 1):
             for passage_id in row["passage_ids"]:
                 passage = by_passage[passage_id]
-                role = row["source_role"] if not row["needs_review"] else "context"
+                # Un fait à revoir reste « context », sauf un verrou dont la relecture
+                # ciblée a confirmé qu'il vient du projet : il reste signalé à revoir.
+                confirmed = bool(row.get("provenance_confirmed")) and not any(
+                    _external_source_marker(by_passage[p]) for p in row["passage_ids"])
+                role = row["source_role"] if (not row["needs_review"] or confirmed) else "context"
                 item_id = f"it_fast_{index}_{passage_id}"
                 evidence = EvidenceRef(
                     evidence_id=f"ev_fast_{_sha(item_id)[:16]}",
@@ -835,6 +889,7 @@ class GlobalFastExtractor:
                         "reported_source_role": row.get("reported_source_role") or row["source_role"],
                         "validation_error": row.get("validation_error", ""),
                         "provenance_reason": row.get("provenance_reason", ""),
+                        "provenance_confirmed": confirmed,
                         "lock_candidate_admission": (row["kind"] == "lock" and
                             row["source_role"] == "project_evidence" and not row.get("validation_error")),
                     },
