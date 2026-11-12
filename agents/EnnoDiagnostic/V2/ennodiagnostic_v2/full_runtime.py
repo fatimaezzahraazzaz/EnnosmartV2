@@ -265,9 +265,15 @@ class EnnoDiagnosticV2FullRuntime:
                 EnnoSmartLLMAdapter(
                     request_name="ennodiagnostic:v2:project_synthesis_reviewed",
                     temperature=0.0,
-                    max_output_tokens=4200,
-                    max_complete_output_tokens=4200,
-                    prompt_char_limit=self.global_reviewer_config.max_prompt_chars,
+                    # 4 200 jetons coupaient la synthèse des gros dossiers
+                    # (Filmogène, 12/11) : synthèse, objectifs et 50 points
+                    # d'éligibilité perdus. Au plus une reprise complète, à
+                    # 32 000 (gpt-4.1-mini plafonne à 32 768).
+                    max_output_tokens=16000,
+                    max_complete_output_tokens=32000,
+                    # Même plafond que la démarche R&D et Frascati : le modèle
+                    # lit le dossier complet au lieu d'environ 20 %.
+                    prompt_char_limit=judge_config.max_prompt_chars,
                     fail_on_truncation=True,
                 ),
                 self.domain_tags,
