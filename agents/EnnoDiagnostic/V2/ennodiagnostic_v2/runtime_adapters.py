@@ -4,7 +4,29 @@ from dataclasses import replace
 from typing import Optional
 
 from modules.LLM.llm_client import LLMClient
+from . import llm_cache
 from .config import GlobalFastPathConfig, GlobalReviewerConfig, JudgeConfig
+
+# Appels directs longs (audit, jugements) : même délai maximal que l'attente
+# du mode arrière-plan d'OpenAI, sans sa file d'attente.
+LONG_DIRECT_READ_TIMEOUT = 900
+
+
+def _allow_long_direct_calls(client) -> None:
+    current = getattr(client, "read_timeout", 0) or 0
+    client.read_timeout = max(int(current), LONG_DIRECT_READ_TIMEOUT)
+
+
+def _cached_generate(client, request_name: str, model, effort, prompt: str, generate):
+    """Ne paie qu'une fois une question identique ; voir llm_cache."""
+    key = llm_cache.make_key(request_name, getattr(client, "provider", ""), model, effort, prompt)
+    cached = llm_cache.get(key)
+    if cached is not None:
+        llm_cache.mark_hit(client, request_name, model)
+        return cached
+    raw = generate()
+    llm_cache.put(key, raw, request_name)
+    return raw
 
 
 class EnnoSmartLLMAdapter:
@@ -53,6 +75,13 @@ class EnnoSmartLLMAdapter:
             f"CONTENU A ANALYSER\n"
             f"{str(user_prompt or '').strip()}"
         )
+        resolve = getattr(self.client, "_default_model_for_request", None)
+        model = resolve(self.request_name) if callable(resolve) else getattr(self.client, "openai_model", "")
+        key = llm_cache.make_key(self.request_name, getattr(self.client, "provider", ""), model, "", prompt)
+        cached = llm_cache.get(key)
+        if cached is not None:
+            llm_cache.mark_hit(self.client, self.request_name, model)
+            return cached
 
         output_budget = self.max_output_tokens
         attempts = []
@@ -88,6 +117,7 @@ class EnnoSmartLLMAdapter:
             if not truncated:
                 if reason in {"content_filter", "safety", "recitation"}:
                     raise RuntimeError(f"Réponse diagnostic non terminée: {reason}.")
+                llm_cache.put(key, raw, self.request_name)
                 return raw
 
             next_budget = min(self.max_complete_output_tokens, output_budget * 2)
@@ -135,17 +165,21 @@ class GlobalReasonerLLMAdapter:
             "INSTRUCTIONS SPECIFIQUES\n" + system_prompt.strip()
             + "\n\nDOSSIER A REVOIR\n" + user_prompt.strip()
         )
-        return self.client.generate(
-            prompt=prompt,
-            temperature=0.0,
-            max_output_tokens=self.config.max_output_tokens,
-            retries=1,
-            json_mode=True,
-            request_name="ennodiagnostic:v2:global_project_review",
-            prompt_char_limit=self.config.max_prompt_chars,
-            fail_on_truncation=True,
-            reasoning_effort=self.config.reasoning_effort,
-            background=self.config.provider == "openai" and self.config.background,
+        request_name = "ennodiagnostic:v2:global_project_review"
+        return _cached_generate(
+            self.client, request_name, self.config.global_reasoner_model, self.config.reasoning_effort, prompt,
+            lambda: self.client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_output_tokens=self.config.max_output_tokens,
+                retries=1,
+                json_mode=True,
+                request_name=request_name,
+                prompt_char_limit=self.config.max_prompt_chars,
+                fail_on_truncation=True,
+                reasoning_effort=self.config.reasoning_effort,
+                background=self.config.provider == "openai" and self.config.background,
+            ),
         )
 
 
@@ -161,25 +195,33 @@ class GlobalFastLLMAdapter:
         self.client.allow_cross_provider_fallback = False
         self.client.openai_fallback_models = []
         self.client.openrouter_fallback_models = []
+        if self.request_name.endswith(":completeness_audit"):
+            _allow_long_direct_calls(self.client)
 
     def fork(self) -> "GlobalFastLLMAdapter":
         return GlobalFastLLMAdapter(self.config, request_name=self.request_name)
 
     def extract_json(self, system_prompt: str, user_prompt: str) -> str:
-        return self.client.generate(
-            prompt="INSTRUCTIONS SPECIFIQUES\n" + system_prompt.strip()
-            + "\n\nDOSSIER BRUT\n" + user_prompt.strip(),
-            temperature=0.0,
-            max_output_tokens=self.config.max_output_tokens,
-            retries=0,
-            json_mode=True,
-            request_name=getattr(self, "request_name", "ennodiagnostic:v2:global_fast_extract"),
-            prompt_char_limit=self.config.max_prompt_chars,
-            fail_on_truncation=True,
-            reasoning_effort=self.config.reasoning_effort,
-            # Les lots d'extraction et leurs réparations sont courts. L'audit
-            # global garde le mode asynchrone pour ses demandes plus longues.
-            background=self.config.provider == "openai" and self.request_name.endswith(":completeness_audit"),
+        prompt = ("INSTRUCTIONS SPECIFIQUES\n" + system_prompt.strip()
+                  + "\n\nDOSSIER BRUT\n" + user_prompt.strip())
+        request_name = getattr(self, "request_name", "ennodiagnostic:v2:global_fast_extract")
+        return _cached_generate(
+            self.client, request_name, self.config.model, self.config.reasoning_effort, prompt,
+            lambda: self.client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_output_tokens=self.config.max_output_tokens,
+                retries=0,
+                json_mode=True,
+                request_name=request_name,
+                prompt_char_limit=self.config.max_prompt_chars,
+                fail_on_truncation=True,
+                reasoning_effort=self.config.reasoning_effort,
+                # Appel direct pour les lots comme pour l'audit : même modèle et
+                # même prompt, sans la file d'attente du mode arrière-plan
+                # (jusqu'à 7 fois plus lente sur le même lot, mesure du 11/11).
+                background=False,
+            ),
         )
 
 
@@ -200,18 +242,23 @@ class JudgeLLMAdapter:
         self.client.allow_cross_provider_fallback = False
         self.client.openai_fallback_models = []
         self.client.openrouter_fallback_models = []
+        _allow_long_direct_calls(self.client)
 
     def extract_json(self, system_prompt: str, user_prompt: str) -> str:
-        return self.client.generate(
-            prompt="INSTRUCTIONS SPECIFIQUES\n" + str(system_prompt or "").strip()
-            + "\n\nCONTENU A ANALYSER\n" + str(user_prompt or "").strip(),
-            temperature=0.0,
-            max_output_tokens=self.config.max_output_tokens,
-            retries=1,
-            json_mode=True,
-            request_name=self.request_name,
-            prompt_char_limit=self.config.max_prompt_chars,
-            fail_on_truncation=True,
-            reasoning_effort=self.config.reasoning_effort,
-            background=self.config.provider == "openai",
+        prompt = ("INSTRUCTIONS SPECIFIQUES\n" + str(system_prompt or "").strip()
+                  + "\n\nCONTENU A ANALYSER\n" + str(user_prompt or "").strip())
+        return _cached_generate(
+            self.client, self.request_name, self.config.model, self.config.reasoning_effort, prompt,
+            lambda: self.client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_output_tokens=self.config.max_output_tokens,
+                retries=1,
+                json_mode=True,
+                request_name=self.request_name,
+                prompt_char_limit=self.config.max_prompt_chars,
+                fail_on_truncation=True,
+                reasoning_effort=self.config.reasoning_effort,
+                background=False,
+            ),
         )

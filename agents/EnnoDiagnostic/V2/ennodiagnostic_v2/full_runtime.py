@@ -6,6 +6,7 @@ from copy import deepcopy
 from uuid import uuid4
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from . import llm_cache
 from .cir_scoring import CIRDiagnosticScore, CIRScorer
 from .config import GlobalFastPathConfig, GlobalReviewerConfig, JudgeConfig, PipelineConfig
 from .global_fast_path import GlobalFastExtractor
@@ -285,6 +286,8 @@ class EnnoDiagnosticV2FullRuntime:
         self.scorer = CIRScorer()
 
     def run(self, documents: Iterable[DocumentInput]) -> FullRuntimeResult:
+        # Réponses déjà payées par un run précédent sur des questions identiques.
+        llm_cache.begin_run()
         timings = StageTimings(self.run_label)
         self.core.qualifier.run_label = self.run_label
         core = timings.call("core", self.core.run, list(documents))
@@ -354,6 +357,13 @@ class EnnoDiagnosticV2FullRuntime:
             synthesis=synthesis if reuse_reviewed_synthesis else legacy_synthesis_for_scoring,
         )
         core.audit["execution"] = {"post_workers": workers, "stage_seconds": timings.seconds}
+        cache_stats = llm_cache.stats()
+        core.audit["llm_cache"] = cache_stats
+        print(
+            f"[EnnoDiagnostic][LLMCache] {cache_stats['hits']} réponse(s) réutilisée(s), "
+            f"{cache_stats['stored']} nouvelle(s) conservée(s)",
+            flush=True,
+        )
 
         return FullRuntimeResult(
             version=VERSION,
