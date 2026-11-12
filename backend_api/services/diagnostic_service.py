@@ -723,6 +723,25 @@ def read_diagnostic_bundle(project: Project, *, compact: bool = False) -> Dict[s
 # Full AI pipeline
 # ============================================================
 
+def _diagnostic_ocr_page_workers() -> int:
+    """8 pages OCR en parallèle (texte identique à 4, mesuré le 12/11), sans dépasser les CPU."""
+    configured = os.getenv("ENNOSMART_OCR_PAGE_WORKERS", "").strip()
+    if configured.isdigit() and int(configured) > 0:
+        return int(configured)
+    return max(1, min(8, os.cpu_count() or 4))
+
+
+def _diagnostic_fulltext_cache_dir() -> Optional[Path]:
+    """Texte extrait réutilisé pour un fichier inchangé ; ENNOSMART_DIAGNOSTIC_FULLTEXT_CACHE=0 le coupe."""
+    if os.getenv("ENNOSMART_DIAGNOSTIC_FULLTEXT_CACHE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    try:
+        from modules.common.runtime_paths import storage_root
+        return storage_root() / "ennodiagnostic_fulltext_cache"
+    except Exception:
+        return None
+
+
 def _prepare_ennodiagnostic_v2_sources(
     db: Session,
     project: Project,
@@ -785,7 +804,10 @@ def _prepare_ennodiagnostic_v2_sources(
         f"[EnnoDiagnostic V2][2/4] Extraction fulltext de {len(raw_paths)} document(s)",
         flush=True,
     )
-    with parallel_tesseract_pages(4):
+    from modules.NLP.document_loader import fulltext_cache, fulltext_cache_stats
+
+    ocr_workers = _diagnostic_ocr_page_workers()
+    with parallel_tesseract_pages(ocr_workers), fulltext_cache(_diagnostic_fulltext_cache_dir()):
         documents = load_documents(
             raw_paths,
             use_ennosmart_extraction=True,
@@ -794,6 +816,12 @@ def _prepare_ennodiagnostic_v2_sources(
             vision_mode="text_only",
             formula_mode=os.getenv("ENNOSMART_DIAGNOSTIC_FORMULA_MODE", "fast"),
         )
+    reused = fulltext_cache_stats()
+    print(
+        f"[EnnoDiagnostic V2][2/4] Texte réutilisé pour {reused['hits']}/{len(raw_paths)} document(s) inchangé(s) ; "
+        f"OCR sur {ocr_workers} pages en parallèle",
+        flush=True,
+    )
     if not documents:
         raise RuntimeError("Aucun texte exploitable extrait des documents bruts.")
 

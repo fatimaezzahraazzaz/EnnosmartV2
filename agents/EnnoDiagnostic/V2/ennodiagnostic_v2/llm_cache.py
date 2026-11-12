@@ -22,6 +22,14 @@ _RUN_STARTED = 0.0  # avant le premier run, rien n'est réutilisé
 _STATS = {"hits": 0, "misses": 0, "stored": 0}
 
 
+def _empty_cost() -> dict:
+    return {"paid_calls": 0, "input_tokens": 0, "cached_input_tokens": 0,
+            "output_tokens": 0, "cost_usd": 0.0, "unpriced_calls": 0, "by_request": {}}
+
+
+_COST = _empty_cost()
+
+
 def enabled() -> bool:
     return os.getenv("ENNOSMART_DIAGNOSTIC_LLM_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -38,15 +46,39 @@ def cache_root() -> Optional[Path]:
 
 
 def begin_run() -> None:
-    global _RUN_STARTED
+    global _RUN_STARTED, _COST
     with _LOCK:
         _RUN_STARTED = time.time()
         _STATS.update(hits=0, misses=0, stored=0)
+        _COST = _empty_cost()
 
 
 def stats() -> dict:
     with _LOCK:
-        return dict(_STATS)
+        cost = {**_COST, "by_request": {k: dict(v) for k, v in _COST["by_request"].items()}}
+        return {**_STATS, "cost": cost}
+
+
+def record_paid_call(client: Any, request_name: str, model: Any, provider: Any) -> None:
+    """Coût réel d'un appel payé, d'après l'usage renvoyé par le fournisseur."""
+    try:
+        getter = getattr(client, "get_last_generation_meta", None)
+        meta = dict(getter() or {}) if callable(getter) else {}
+        from modules.LLM.usage_budget import compute_cost, normalize_usage
+        usage = normalize_usage(meta)
+        priced = compute_cost(meta.get("model") or model, meta.get("provider") or provider, usage)
+    except Exception:
+        usage, priced = {}, {"cost_usd": 0.0, "price_known": False}
+    with _LOCK:
+        row = _COST["by_request"].setdefault(request_name, {"paid_calls": 0, "cost_usd": 0.0, "output_tokens": 0})
+        for target in (_COST, row):
+            target["paid_calls"] += 1
+            target["cost_usd"] = round(target["cost_usd"] + float(priced.get("cost_usd") or 0.0), 6)
+            target["output_tokens"] += int(usage.get("output_tokens") or 0)
+        _COST["input_tokens"] += int(usage.get("input_tokens") or 0)
+        _COST["cached_input_tokens"] += int(usage.get("cached_input_tokens") or 0)
+        if not priced.get("price_known"):
+            _COST["unpriced_calls"] += 1
 
 
 def _count(name: str) -> None:

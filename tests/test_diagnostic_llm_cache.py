@@ -104,6 +104,27 @@ class LLMCacheTests(unittest.TestCase):
         adapter.extract_json("système", "verrous")
         self.assertEqual(len(client.calls), 1)
 
+    def test_each_paid_call_is_priced_and_reused_answers_cost_nothing(self):
+        class PricedClient(FakeClient):
+            def generate(self, **kwargs):
+                answer = super().generate(**kwargs)
+                self._last_generation_meta = {"model": "gpt-4.1-mini", "provider": "openai",
+                                              "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+                return answer
+
+        adapter = GlobalFastLLMAdapter(GlobalFastPathConfig(), request_name="ennodiagnostic:v2:global_fast_extract")
+        adapter.client = PricedClient()
+        self.new_run()
+        adapter.extract_json("système", "lot 1")
+        cost = llm_cache.stats()["cost"]
+        self.assertEqual(cost["paid_calls"], 1)
+        self.assertAlmostEqual(cost["cost_usd"], 2.0)  # 0,40 $ + 1,60 $ par million (table de prix du code)
+        self.assertEqual(cost["by_request"]["ennodiagnostic:v2:global_fast_extract"]["paid_calls"], 1)
+        self.new_run()
+        adapter.extract_json("système", "lot 1")
+        self.assertEqual(llm_cache.stats()["cost"]["paid_calls"], 0)
+        self.assertEqual(llm_cache.stats()["hits"], 1)
+
     def test_audit_and_judges_call_openai_directly_with_a_long_timeout(self):
         audit = GlobalFastLLMAdapter(GlobalFastPathConfig(), request_name="ennodiagnostic:v2:completeness_audit")
         self.assertGreaterEqual(audit.client.read_timeout, 900)

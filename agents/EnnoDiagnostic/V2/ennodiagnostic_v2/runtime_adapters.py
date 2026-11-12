@@ -25,6 +25,7 @@ def _cached_generate(client, request_name: str, model, effort, prompt: str, gene
         llm_cache.mark_hit(client, request_name, model)
         return cached
     raw = generate()
+    llm_cache.record_paid_call(client, request_name, model, getattr(client, "provider", ""))
     llm_cache.put(key, raw, request_name)
     return raw
 
@@ -98,6 +99,7 @@ class EnnoSmartLLMAdapter:
                 prompt_char_limit=self.prompt_char_limit,
                 fail_on_truncation=self.fail_on_truncation,
             )
+            llm_cache.record_paid_call(self.client, self.request_name, model, getattr(self.client, "provider", ""))
             getter = getattr(self.client, "get_last_generation_meta", None)
             meta = dict(getter() or {}) if callable(getter) else {}
             actual_budget = int(meta.get("max_output_tokens") or output_budget)

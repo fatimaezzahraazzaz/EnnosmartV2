@@ -358,12 +358,27 @@ class EnnoDiagnosticV2FullRuntime:
         )
         core.audit["execution"] = {"post_workers": workers, "stage_seconds": timings.seconds}
         cache_stats = llm_cache.stats()
-        core.audit["llm_cache"] = cache_stats
+        cost = cache_stats["cost"]
+        core.audit["llm_cache"] = {k: v for k, v in cache_stats.items() if k != "cost"}
+        core.audit["llm_cost"] = cost
         print(
             f"[EnnoDiagnostic][LLMCache] {cache_stats['hits']} réponse(s) réutilisée(s), "
             f"{cache_stats['stored']} nouvelle(s) conservée(s)",
             flush=True,
         )
+        print(
+            f"[EnnoDiagnostic][Coût] {cost['paid_calls']} appel(s) payé(s), "
+            f"{cost['input_tokens']} jetons d'entrée (dont {cost['cached_input_tokens']} en cache OpenAI), "
+            f"{cost['output_tokens']} de sortie : ${cost['cost_usd']:.3f}"
+            + (f" ({cost['unpriced_calls']} appel(s) sans tarif connu)" if cost["unpriced_calls"] else ""),
+            flush=True,
+        )
+        for request, row in sorted(cost["by_request"].items(), key=lambda item: -item[1]["cost_usd"]):
+            print(
+                f"[EnnoDiagnostic][Coût]   {request.replace('ennodiagnostic:v2:', '')}: "
+                f"{row['paid_calls']} appel(s), ${row['cost_usd']:.3f}",
+                flush=True,
+            )
 
         return FullRuntimeResult(
             version=VERSION,

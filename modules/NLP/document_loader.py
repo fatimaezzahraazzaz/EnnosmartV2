@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -68,6 +74,92 @@ def _load_supported_extensions_from_extraction_router() -> set[str]:
 
 
 SUPPORTED_EXTENSIONS = _load_supported_extensions_from_extraction_router()
+
+
+# Texte extrait réutilisé par fichier. Désactivé par défaut : seul l'appelant
+# qui ouvre fulltext_cache() en profite (EnnoDiagnostic). La clé change dès que
+# le contenu du fichier, les réglages, le code d'extraction ou Tesseract changent.
+_FULLTEXT_CACHE_DIR: ContextVar[Optional[Path]] = ContextVar("fulltext_cache_dir", default=None)
+_FULLTEXT_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+@contextmanager
+def fulltext_cache(directory: Optional[Path]):
+    token = _FULLTEXT_CACHE_DIR.set(Path(directory) if directory else None)
+    _FULLTEXT_CACHE_STATS.update(hits=0, misses=0)
+    try:
+        yield
+    finally:
+        _FULLTEXT_CACHE_DIR.reset(token)
+
+
+def fulltext_cache_stats() -> Dict[str, int]:
+    return dict(_FULLTEXT_CACHE_STATS)
+
+
+@functools.lru_cache(maxsize=1)
+def _extraction_code_fingerprint() -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted([Path(__file__).resolve(), *(root / "extraction").rglob("*.py")]):
+        try:
+            digest.update(str(path.relative_to(root)).encode("utf-8"))
+            digest.update(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+    tesseract = os.getenv("TESSERACT_CMD") or shutil.which("tesseract") or ""
+    try:
+        stat = Path(tesseract).stat() if tesseract else None
+        digest.update(f"{tesseract}:{stat.st_size}:{int(stat.st_mtime)}".encode("utf-8") if stat else b"no-tesseract")
+    except OSError:
+        digest.update(b"tesseract-unavailable")
+    return digest.hexdigest()
+
+
+def _fulltext_cache_key(path: Path, vision_mode: Optional[str], formula_mode: Optional[str],
+                        use_ennosmart_extraction: bool) -> Optional[str]:
+    try:
+        content = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    settings = sorted(
+        (name, value) for name, value in os.environ.items()
+        if name.startswith(("OCR_", "TESSERACT", "ENNOSMART_OCR", "ENNOSMART_EXTRACTION",
+                            "ENNOSMART_DIAGNOSTIC_FORMULA", "ENNOSMART_DIAGNOSTIC_VISION"))
+    )
+    payload = ["fulltext-v1", content, path.suffix.lower(), vision_mode, formula_mode,
+               bool(use_ennosmart_extraction), _extraction_code_fingerprint(), settings]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _read_fulltext_cache(directory: Path, key: str) -> Optional[tuple]:
+    try:
+        entry = json.loads((directory / key[:2] / f"{key}.json").read_text(encoding="utf-8"))
+        if isinstance(entry.get("text"), str) and entry["text"].strip():
+            return entry["text"], str(entry.get("loader") or "modules.extraction.router")
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _write_fulltext_cache(directory: Path, key: str, text: str, loader: str) -> None:
+    temporary = None
+    try:
+        target = directory / key[:2] / f"{key}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, delete=False, suffix=".tmp") as handle:
+            json.dump({"text": text, "loader": loader}, handle, ensure_ascii=False)
+            temporary = handle.name
+        os.replace(temporary, target)
+        temporary = None
+    except OSError:
+        pass
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def normalize_chunks(value: Any) -> List[str]:
@@ -461,21 +553,32 @@ def load_document(
             "error": f"Extension non supportée : {ext}",
         }
 
-    text = (
-        extract_with_ennosmart_router(
-            str(p),
-            vision_mode=vision_mode,
-            formula_mode=formula_mode,
+    cache_dir = _FULLTEXT_CACHE_DIR.get()
+    cache_key = _fulltext_cache_key(p, vision_mode, formula_mode, use_ennosmart_extraction) if cache_dir else None
+    cached = _read_fulltext_cache(cache_dir, cache_key) if cache_key else None
+    if cached is not None:
+        _FULLTEXT_CACHE_STATS["hits"] += 1
+        text, loader = cached
+    else:
+        text = (
+            extract_with_ennosmart_router(
+                str(p),
+                vision_mode=vision_mode,
+                formula_mode=formula_mode,
+            )
+            if use_ennosmart_extraction
+            else None
         )
-        if use_ennosmart_extraction
-        else None
-    )
-    loader = "modules.extraction.router" if text else "fallback"
+        loader = "modules.extraction.router" if text else "fallback"
 
-    if not text:
-        text = fallback_extract(str(p))
+        if not text:
+            text = fallback_extract(str(p))
 
-    text = clean_text(text)
+        text = clean_text(text)
+        if cache_key:
+            _FULLTEXT_CACHE_STATS["misses"] += 1
+            if text and text.strip():
+                _write_fulltext_cache(cache_dir, cache_key, text, loader)
 
     origin = infer_origin(p.name, text)
 
