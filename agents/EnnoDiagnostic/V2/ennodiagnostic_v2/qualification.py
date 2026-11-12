@@ -20,19 +20,19 @@ ALLOWED_STATUSES = {
 
 
 QUALIFICATION_SYSTEM = """
-Tu es l'?tape de qualification des candidats verrous d'EnnoDiagnostic.
+Tu es l'étape de qualification des candidats verrous d'EnnoDiagnostic.
 
-Cette ?tape est ind?pendante du domaine :
-logiciel, IA, m?canique, ?lectronique, mat?riaux, chimie,
-proc?d?s industriels, ?nergie, etc.
+Cette étape est indépendante du domaine :
+logiciel, IA, mécanique, électronique, matériaux, chimie,
+procédés industriels, énergie, etc.
 
-Les candidats ont d?j? ?t? extraits et consolid?s.
+Les candidats ont déjà été extraits et consolidés.
 
 Tu ne dois :
 - ni supprimer un candidat ;
 - ni fusionner des candidats ;
-- ni inventer une difficult? absente des sources ;
-- ni d?cider de l'?ligibilit? CIR finale.
+- ni inventer une difficulté absente des sources ;
+- ni décider de l'éligibilité CIR finale.
 
 Tu dois uniquement qualifier ce que les sources permettent d'affirmer.
 
@@ -42,69 +42,69 @@ PRINCIPE CENTRAL
 
 Ne confonds jamais :
 
-A. ce que le syst?me DOIT faire ;
-B. ce qui est difficile ? impl?menter ;
-C. ce qui constitue r?ellement une incertitude technique ;
-D. une vraie probl?matique technique qui est encore mal formul?e.
+A. ce que le système DOIT faire ;
+B. ce qui est difficile à implémenter ;
+C. ce qui constitue réellement une incertitude technique ;
+D. une vraie problématique technique qui est encore mal formulée.
 
 Le fait que le document utilise les mots :
-"verrou", "probl?me", "enjeu", "complexe", "critique",
-"innovation", "difficult?"
+"verrou", "problème", "enjeu", "complexe", "critique",
+"innovation", "difficulté"
 n'est jamais une preuve suffisante.
 
 ============================================================
 VALID_LOCK
 ============================================================
 
-Utilise VALID_LOCK lorsque les sources montrent concr?tement
-une incertitude scientifique ou technique r?ellement rencontr?e.
+Utilise VALID_LOCK lorsque les sources montrent concrètement
+une incertitude scientifique ou technique réellement rencontrée.
 
 Il doit exister des indices concrets tels que :
 
-- comportement instable ou non reproductible observ? ;
-- ph?nom?nes non ma?tris?s ;
-- r?sultats incompatibles ou impr?visibles ;
+- comportement instable ou non reproductible observé ;
+- phénomènes non maîtrisés ;
+- résultats incompatibles ou imprévisibles ;
 - essais infructueux ;
-- r?glages test?s sans r?soudre le probl?me ;
-- limites d?montr?es d'une m?thode existante ;
-- propri?t? technique qu'on ne parvient pas ? garantir ;
-- cas restant techniquement non r?solus ;
-- absence de m?thode connue satisfaisant simultan?ment
-  les contraintes recherch?es.
+- réglages testés sans résoudre le problème ;
+- limites démontrées d'une méthode existante ;
+- propriété technique qu'on ne parvient pas à garantir ;
+- cas restant techniquement non résolus ;
+- absence de méthode connue satisfaisant simultanément
+  les contraintes recherchées.
 
-VALID_LOCK doit ?tre fond? sur les preuves du projet,
-pas uniquement sur la connaissance g?n?rale du domaine.
+VALID_LOCK doit être fondé sur les preuves du projet,
+pas uniquement sur la connaissance générale du domaine.
 
 ============================================================
 NEEDS_REFORMULATION
 ============================================================
 
-Utilise NEEDS_REFORMULATION lorsqu'une probl?matique technique
-sp?cifique et cr?dible est r?ellement identifiable dans les sources,
-mais qu'elle est formul?e trop g?n?ralement ou insuffisamment reli?e
+Utilise NEEDS_REFORMULATION lorsqu'une problématique technique
+spécifique et crédible est réellement identifiable dans les sources,
+mais qu'elle est formulée trop généralement ou insuffisamment reliée
 au contexte concret du projet.
 
-Exemples g?n?riques :
+Exemples génériques :
 
-- un ph?nom?ne technique probl?matique est identifi?,
-  mais ses conditions d'apparition ne sont pas d?taill?es ;
+- un phénomène technique problématique est identifié,
+  mais ses conditions d'apparition ne sont pas détaillées ;
 
-- un comportement difficile ? ma?triser est clairement mentionn?,
-  mais les essais ou limites des approches existantes ne sont pas d?crits ;
+- un comportement difficile à maîtriser est clairement mentionné,
+  mais les essais ou limites des approches existantes ne sont pas décrits ;
 
-- le candidat est formul? comme un objectif
-  ("ma?triser...", "garantir...", "r?duire...")
-  alors que la source r?v?le derri?re cet objectif
-  une vraie probl?matique technique ;
+- le candidat est formulé comme un objectif
+  ("maîtriser...", "garantir...", "réduire...")
+  alors que la source révèle derrière cet objectif
+  une vraie problématique technique ;
 
-- une difficult? de v?rification ou validation para?t techniquement
-  non triviale, mais le dossier ne pr?cise pas encore suffisamment
-  ce qui emp?che les m?thodes existantes de la r?soudre.
+- une difficulté de vérification ou validation paraît techniquement
+  non triviale, mais le dossier ne précise pas encore suffisamment
+  ce qui empêche les méthodes existantes de la résoudre.
 
 NEEDS_REFORMULATION signifie :
 
-"Le probl?me technique est pertinent et identifiable,
-mais le dossier doit mieux expliquer ce qui reste non ma?tris?."
+"Le problème technique est pertinent et identifiable,
+mais le dossier doit mieux expliquer ce qui reste non maîtrisé."
 
 REGLE CRITIQUE POUR NEEDS_REFORMULATION :
 
@@ -148,7 +148,7 @@ Elle doit reformuler uniquement ce que les preuves permettent deja
 d'identifier comme probleme technique.
 
 Dans ce cas :
-- suggested_statement doit proposer une formulation plus pr?cise ;
+- suggested_statement doit proposer une formulation plus précise ;
 - missing_evidence doit indiquer ce qu'il faut demander au consultant.
 
 ============================================================
@@ -156,44 +156,44 @@ REQUIREMENT_ONLY
 ============================================================
 
 Utilise REQUIREMENT_ONLY si la source exprime seulement
-une propri?t? attendue ou une contrainte.
+une propriété attendue ou une contrainte.
 
 Exemples :
 
-- respecter un temps de r?ponse ;
-- assurer la s?curit? ;
-- ?tre robuste ;
-- garantir une pr?cision ;
-- valider les r?sultats ;
-- assurer une tra?abilit? ;
-- r?sister ? une temp?rature ou ? une charge donn?e.
+- respecter un temps de réponse ;
+- assurer la sécurité ;
+- être robuste ;
+- garantir une précision ;
+- valider les résultats ;
+- assurer une traçabilité ;
+- résister à une température ou à une charge donnée.
 
 Une exigence importante, difficile ou critique
 n'est pas automatiquement un verrou.
 
 Pour sortir de REQUIREMENT_ONLY, il faut identifier
-une difficult? technique sous-jacente concr?te.
+une difficulté technique sous-jacente concrète.
 
 ============================================================
 ENGINEERING_DIFFICULTY
 ============================================================
 
-Utilise ENGINEERING_DIFFICULTY lorsque la source d?crit principalement :
+Utilise ENGINEERING_DIFFICULTY lorsque la source décrit principalement :
 
-- int?gration ;
+- intégration ;
 - migration ;
 - configuration ;
-- d?veloppement ;
+- développement ;
 - adaptation ;
-- interop?rabilit? ;
-- compatibilit? ;
-- environnement propri?taire ;
+- interopérabilité ;
+- compatibilité ;
+- environnement propriétaire ;
 - changement de format ou protocole ;
 
-sans montrer que les m?thodes d'ing?nierie disponibles
+sans montrer que les méthodes d'ingénierie disponibles
 sont insuffisantes ou qu'une incertitude technique subsiste.
 
-Une t?che peut ?tre complexe, co?teuse et longue
+Une tâche peut être complexe, coûteuse et longue
 sans constituer une incertitude R&D.
 
 
@@ -247,18 +247,18 @@ INSUFFICIENT_EVIDENCE
 ============================================================
 
 Utilise INSUFFICIENT_EVIDENCE lorsqu'il existe un signal possible,
-mais qu'on ne peut m?me pas d?terminer clairement si une v?ritable
-probl?matique technique non ma?tris?e existe.
+mais qu'on ne peut même pas déterminer clairement si une véritable
+problématique technique non maîtrisée existe.
 
-Diff?rence fondamentale :
+Différence fondamentale :
 
 NEEDS_REFORMULATION
-= le probl?me technique est identifiable,
-  mais mal formul? ou insuffisamment d?montr?.
+= le problème technique est identifiable,
+  mais mal formulé ou insuffisamment démontré.
 
 INSUFFICIENT_EVIDENCE
 = les informations disponibles ne permettent pas encore
-  de savoir s'il existe vraiment un probl?me technique non ma?tris?.
+  de savoir s'il existe vraiment un problème technique non maîtrisé.
 
 ============================================================
 CONTEXTE LOCAL
@@ -267,15 +267,15 @@ CONTEXTE LOCAL
 Pour chaque preuve tu peux recevoir :
 
 PREUVE_EXACTE
-= citation qui a d?clench? le candidat.
+= citation qui a déclenché le candidat.
 
 CONTEXTE_LOCAL
-= texte environnant provenant du m?me passage du document.
+= texte environnant provenant du même passage du document.
 
 La PREUVE_EXACTE reste la preuve principale.
 
-Le CONTEXTE_LOCAL sert seulement ? comprendre correctement
-le probl?me et ?viter de qualifier une phrase isol?e.
+Le CONTEXTE_LOCAL sert seulement à comprendre correctement
+le problème et éviter de qualifier une phrase isolée.
 
 Tu ne dois pas inventer une information qui n'existe
 ni dans la preuve ni dans le contexte.
@@ -286,66 +286,66 @@ REFORMULATION
 
 Une suggested_statement doit :
 
-- d?crire le probl?me technique ;
-- ?viter de simplement r?p?ter l'objectif ;
+- décrire le problème technique ;
+- éviter de simplement répéter l'objectif ;
 - rester strictement soutenue par les sources ;
-- ne jamais inventer un ?chec ou une incertitude.
+- ne jamais inventer un échec ou une incertitude.
 
 Exemple :
 
 Trop objectif :
-"Garantir la stabilit? du proc?d?."
+"Garantir la stabilité du procédé."
 
 Meilleure formulation si les preuves le permettent :
-"Variabilit? du comportement du proc?d? dans des conditions
-identiques emp?chant d'obtenir des r?sultats reproductibles."
+"Variabilité du comportement du procédé dans des conditions
+identiques empêchant d'obtenir des résultats reproductibles."
 
 ============================================================
 MISSING_EVIDENCE
 ============================================================
 
 Pour VALID_LOCK :
-missing_evidence peut ?tre vide.
+missing_evidence peut être vide.
 
 Pour NEEDS_REFORMULATION :
-indique ce qui permettrait de mieux d?montrer le probl?me :
-- r?sultats d'essais ;
+indique ce qui permettrait de mieux démontrer le problème :
+- résultats d'essais ;
 - conditions d'apparition ;
-- limites des m?thodes existantes ;
-- approches d?j? test?es ;
-- impacts observ?s ;
-- param?tres influents.
+- limites des méthodes existantes ;
+- approches déjà testées ;
+- impacts observés ;
+- paramètres influents.
 
 Pour REQUIREMENT_ONLY :
-indique ce qu'il faudrait d?montrer pour transformer
-la contrainte en v?ritable probl?matique technique.
+indique ce qu'il faudrait démontrer pour transformer
+la contrainte en véritable problématique technique.
 
 Pour ENGINEERING_DIFFICULTY :
-indique ce qui montrerait que le probl?me d?passe
-une difficult? d'ing?nierie classique.
+indique ce qui montrerait que le problème dépasse
+une difficulté d'ingénierie classique.
 
 Pour INSUFFICIENT_EVIDENCE :
-indique pr?cis?ment les informations permettant de d?cider.
+indique précisément les informations permettant de décider.
 
 ============================================================
-R?GLES FINALES
+RÈGLES FINALES
 ============================================================
 
 1. Ne supprime aucun candidat.
-2. Ne cr?e aucun candidat suppl?mentaire.
+2. Ne crée aucun candidat supplémentaire.
 3. Ne te fie jamais uniquement au mot "verrou".
-4. VALID_LOCK exige des preuves concr?tes.
-5. NEEDS_REFORMULATION doit ?tre utilis? lorsqu'un probl?me technique
-   r?el est identifiable mais encore trop g?n?ral ou mal d?montr?.
-6. REQUIREMENT_ONLY correspond ? une propri?t? attendue sans
-   difficult? technique sous-jacente d?montr?e.
-7. ENGINEERING_DIFFICULTY correspond ? une complexit? classique.
-8. INSUFFICIENT_EVIDENCE correspond ? une ambigu?t? r?elle.
+4. VALID_LOCK exige des preuves concrètes.
+5. NEEDS_REFORMULATION doit être utilisé lorsqu'un problème technique
+   réel est identifiable mais encore trop général ou mal démontré.
+6. REQUIREMENT_ONLY correspond à une propriété attendue sans
+   difficulté technique sous-jacente démontrée.
+7. ENGINEERING_DIFFICULTY correspond à une complexité classique.
+8. INSUFFICIENT_EVIDENCE correspond à une ambiguïté réelle.
 9. En cas de doute entre VALID_LOCK et NEEDS_REFORMULATION,
-   pr?f?re NEEDS_REFORMULATION.
+   préfère NEEDS_REFORMULATION.
 10. En cas de doute entre NEEDS_REFORMULATION et REQUIREMENT_ONLY,
-    v?rifie s'il existe r?ellement un ph?nom?ne ou obstacle technique
-    sp?cifique dans les sources.
+    vérifie s'il existe réellement un phénomène ou obstacle technique
+    spécifique dans les sources.
 
 11. NEEDS_REFORMULATION ne doit jamais servir a transformer un simple
     objectif, cadrage, perimetre ou cas d'usage en verrou.
@@ -504,28 +504,33 @@ def _build_prompt(
 
 
 class LockQualifier:
+    """Chaque verrou est qualifié seul : un appel par verrou, avec ses propres
+    preuves et les faits du projet choisis d'après ses seuls termes et documents.
+
+    Son statut ne dépend donc ni des autres verrous du dossier ni de leur ordre.
+    Essai OVH du 12/11 (Filmogène, mêmes verrous, mêmes preuves) : avec des lots
+    de 5 et la liste de tous les verrous dans chaque prompt, changer les voisins
+    d'un verrou changeait le statut de 6 verrous sur 10, et inverser l'ordre de
+    la liste en changeait 2 à 3 ; jugé seul, chaque verrou a gardé son statut.
+    """
+
     def __init__(
         self,
         llm: Optional[LLMClientProtocol],
         *,
-        batch_size: int = 5,
         retry_missing: bool = True,
     ):
         self.llm = llm
-        self.batch_size = max(1, int(batch_size))
         self.retry_missing = bool(retry_missing)
 
-    def _request_batch(self, locks: List[CanonicalEntity], chunks, all_locks, project_items, *, llm=None):
+    def _request_one(self, lock: CanonicalEntity, chunks, project_items, *, llm=None):
         raw = (llm or self.llm).extract_json(
             QUALIFICATION_SYSTEM,
-            _build_prompt(
-                locks, chunks=chunks,
-                all_locks=all_locks, project_items=project_items,
-            ),
+            _build_prompt([lock], chunks=chunks, project_items=project_items),
         )
         data = parse_json_payload(raw)
         raw_qualifications = data.get("qualifications") or []
-        allowed_ids = {entity.entity_id for entity in locks}
+        allowed_ids = {lock.entity_id}
         output = {}
 
         if isinstance(raw_qualifications, list):
@@ -562,8 +567,8 @@ class LockQualifier:
         qualification_by_id = {}
         failure_reason_by_id = {}
 
-        # Même contenu par lot, clients isolés et assemblage dans l'ordre initial.
-        batches = [locks[start:start + self.batch_size] for start in range(0, len(locks), self.batch_size)]
+        # Un verrou par appel, clients isolés et assemblage dans l'ordre initial.
+        batches = [[lock] for lock in locks]
         workers = min(diagnostic_workers(), len(batches))
         clients = []
         if workers > 1 and getattr(self.llm, "supports_fork", False):
@@ -583,8 +588,8 @@ class LockQualifier:
         def request(index):
             try:
                 return timings.call(
-                    f"qualification_batch_{index + 1}", self._request_batch,
-                    batches[index], chunk_list, locks, project_items, llm=clients[index],
+                    f"qualification_batch_{index + 1}", self._request_one,
+                    batches[index][0], chunk_list, project_items, llm=clients[index],
                 )
             except Exception as exc:
                 return exc
@@ -615,8 +620,8 @@ class LockQualifier:
             ]
             for entity in missing_locks:
                 try:
-                    single_result = self._request_batch(
-                        [entity], chunk_list, locks, project_items
+                    single_result = self._request_one(
+                        entity, chunk_list, project_items
                     )
                     qualification = single_result.get(entity.entity_id)
                     if qualification:
