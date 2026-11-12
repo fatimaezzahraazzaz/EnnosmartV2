@@ -6,11 +6,8 @@ from copy import deepcopy
 from uuid import uuid4
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-import os
-
 from . import llm_cache
 from .cir_scoring import CIRDiagnosticScore, CIRScorer
-from .lock_statement_rewriter import LockStatementRewriter
 from .config import GlobalFastPathConfig, GlobalReviewerConfig, JudgeConfig, PipelineConfig
 from .global_fast_path import GlobalFastExtractor
 from .completeness_auditor import CompletenessAuditor
@@ -150,7 +147,6 @@ class EnnoDiagnosticV2FullRuntime:
         fast_config: Optional[GlobalFastPathConfig] = None,
         fast_cache_dir: Optional[str] = None,
         run_label: str = "",
-        lock_rewrite_llm: Optional[LLMClientProtocol] = None,
     ):
         self.run_label = f"{run_label or 'diagnostic'} run={uuid4().hex[:10]}"
         self.domain_tags = parse_domain_tags(domain_tags)
@@ -252,19 +248,6 @@ class EnnoDiagnosticV2FullRuntime:
 
         frascati = frascati_llm or _judge_adapter(judge_config, "ennodiagnostic:v2:project_frascati", 2600)
 
-        # Reformulation vérifiée des candidats cités mot pour mot. Câblage de
-        # production seulement ; ENNOSMART_DIAGNOSTIC_LOCK_REWRITE=0 la coupe.
-        lock_rewriter = None
-        rewrite_enabled = os.getenv("ENNOSMART_DIAGNOSTIC_LOCK_REWRITE", "1").strip().lower() not in {"0", "false", "no", "off"}
-        if lock_rewrite_llm is not None:
-            lock_rewriter = LockStatementRewriter(lock_rewrite_llm)
-        elif rewrite_enabled and fast_extractor is not None and fast_llm is None and not injected_legacy:
-            lock_rewriter = LockStatementRewriter(EnnoSmartLLMAdapter(
-                request_name="ennodiagnostic:v2:lock_statement_rewrite",
-                temperature=0.0,
-                max_output_tokens=4000,
-                fail_on_truncation=True,
-            ))
         self.core = EnnoDiagnosticV2(
             semantic_llm=semantic,
             consolidation_llm=consolidation,
@@ -276,7 +259,6 @@ class EnnoDiagnosticV2FullRuntime:
             ),
             global_reviewer=global_reviewer,
             fast_extractor=fast_extractor,
-            lock_rewriter=lock_rewriter,
         )
         self.families = LockFamilySynthesizer(family)
         reviewed_synthesis = (
