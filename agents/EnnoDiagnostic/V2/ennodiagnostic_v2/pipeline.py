@@ -14,6 +14,7 @@ from .schemas import DocumentInput, PipelineResult
 from .semantic_extractor import LLMClientProtocol, SemanticExtractor
 from .global_project_reviewer import GlobalProjectReviewer
 from .global_fast_path import FastLotReadError, GlobalFastExtractor, build_passages
+from .lock_statement_rewriter import LockStatementRewriter, apply_rewrites
 from .diagnostic_debug import DiagnosticDebug
 
 
@@ -107,12 +108,14 @@ class EnnoDiagnosticV2:
         global_reviewer: Optional[GlobalProjectReviewer] = None,
         fast_extractor: Optional[GlobalFastExtractor] = None,
         debug_directory=None,
+        lock_rewriter: Optional[LockStatementRewriter] = None,
     ):
         self.config = config or PipelineConfig()
         self.global_reviewer = global_reviewer
         self.fast_extractor = fast_extractor
         self.debug_directory = debug_directory
         self.last_debug_reference = None
+        self.lock_rewriter = lock_rewriter
         self.extractor = SemanticExtractor(semantic_llm)
         self.consolidator = GlobalLockConsolidator(
             consolidation_llm or semantic_llm
@@ -180,6 +183,15 @@ class EnnoDiagnosticV2:
              or (item.kind == "lock" and (item.metadata or {}).get("lock_candidate_admission"))]
             if fast_meta and fast_meta.get("status") != "fallback" else extractions
         )
+        # Candidats cités mot pour mot : même constat, phrase technique vérifiée.
+        # Aucun candidat fusionné ou retiré ici ; preuves et identifiants inchangés.
+        rewrite_audit = {"status": "disabled"}
+        if self.lock_rewriter is not None and fast_meta and fast_meta.get("status") != "fallback":
+            self.lock_rewriter.debug_sink = debug
+            mapping, rewrite_audit = self.lock_rewriter.rewrite(admitted)
+            if mapping:
+                admitted = apply_rewrites(admitted, mapping)
+                extractions = apply_rewrites(extractions, mapping)
         self.consolidator.require_intergroup = bool(fast_meta and fast_meta.get("status") != "fallback")
         lock_entities = self.consolidator.consolidate(admitted)
         # Verrous déclarés par les documents : liste principale, les candidats y
@@ -352,6 +364,7 @@ class EnnoDiagnosticV2:
         )
         audit = build_audit(chunks, extractions, entities)
         audit["declared_lock_anchoring"] = self.anchorer.last_report
+        audit["lock_statement_rewrite"] = rewrite_audit
         audit["global_review_status"] = global_review["status"]
         audit["global_review_coverage"] = global_review["coverage"]
         audit["extraction_path"] = (
