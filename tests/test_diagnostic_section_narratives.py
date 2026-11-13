@@ -142,6 +142,19 @@ class DiagnosticSectionNarrativeTests(unittest.TestCase):
         self.assertEqual(len(result.methods), 101)
         self.assertEqual(set(result.section_narratives), set(FACTS))
 
+    def test_keeps_the_paragraph_when_only_the_source_s_emphasis_caps_are_normalised(self):
+        emphasis = "Un TEST DE CHUTE a été réalisé, avec une légère cassure observée."
+        normalised = "Un test de chute a été réalisé, avec une légère cassure observée."
+        self.items[0] = replace(
+            self.items[0], statement=emphasis,
+            evidence=replace(self.items[0].evidence, quote=emphasis),
+        )
+        self.paragraphs["method"][0]["text"] = normalised
+        result = self.synthesize()
+        self.assertEqual(result.section_narratives["method"], [
+            {"text": normalised, "evidence_ids": ["ev_method"]},
+        ])
+
     def test_output_cap_prevents_a_larger_paid_attempt_after_truncation(self):
         client = Mock()
         client.generate.return_value = "{}"

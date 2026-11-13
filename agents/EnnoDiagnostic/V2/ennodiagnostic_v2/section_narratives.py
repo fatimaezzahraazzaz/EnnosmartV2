@@ -109,9 +109,15 @@ def _faithful_phrase(text: str, point: TraceablePoint) -> bool:
         return False
     if re.search(r"[!?]\s+\S|\.\s+[A-ZÀ-ÖØ-Þ]", text):
         return False
-    abbreviations = r"\b[A-Z][A-Z0-9]*\b"
-    if re.findall(abbreviations, text) != re.findall(abbreviations, original):
-        return False
+    # Les majuscules d'emphase des tableaux/notes de labo (« TEST DE CHUTE ») redeviennent
+    # une phrase normale sous la plume du LLM : seule la présence du terme compte, pas sa
+    # casse. Les vrais codes/produits restent de toute façon verifies par les termes
+    # techniques ci-dessous (memes mots, meme ordre).
+    abbreviations = re.findall(r"\b[A-Z][A-Z0-9]*\b", original)
+    if abbreviations:
+        text_tokens = set(_norm(text).split())
+        if any(token.lower() not in text_tokens for token in abbreviations):
+            return False
     executed = r"\b(?:a ete|ont ete|a deja|ont deja|acheve|finalise|termine)\b"
     if point.temporal_status != "performed" and re.search(executed, _norm(text)) and not re.search(executed, _norm(original)):
         return False
