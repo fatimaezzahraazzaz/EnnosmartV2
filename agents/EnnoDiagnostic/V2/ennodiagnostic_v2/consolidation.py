@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import os
 import re
 from dataclasses import asdict, replace
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 from .schemas import CanonicalEntity, EvidenceRef, ExtractionItem
 from .semantic_extractor import LLMClientProtocol, parse_json_payload
@@ -196,6 +198,50 @@ MAX_CANDIDATE_PAIRS = 160
 PAIRS_PER_BATCH = 30
 # Paires internes des verrous fusionnés vérifiées en plus (contrôle des chaînes).
 MAX_COMPLETION_PAIRS = 240
+
+# Regroupement par paires (12-13/11). Sur les mêmes candidats rejoués 4 fois, la
+# partition globale d'un seul appel donnait 10 à 16 verrous et réunissait des
+# problèmes distincts partageant un thème (stabilité à 45 °C et maintien du film
+# sur la lame, 3 fois sur 4). Une première version jugeait les paires par lots de
+# 30 : le modèle confondait les paires (pH à 1 réuni au glissement du film).
+# Chaque paire est donc jugée seule, par une question courte, et un groupe ne se
+# forme que si tous ses membres sont jugés « même problème » deux à deux.
+PAIRWISE_NEIGHBORS = 6
+PAIRWISE_MAX_PAIRS = 400
+PAIRWISE_MAX_COMPLETION = 300
+PAIRWISE_WORKERS = 6
+
+PAIR_SYSTEM = """
+Tu compares DEUX candidats verrous d'un même dossier R&D, avec leurs citations.
+Question : décrivent-ils le MÊME problème technique ?
+- OUI s'ils portent sur le même objet ou la même propriété avec la même défaillance
+  ou incertitude, même si la formulation, le degré (aucune, faible, moyenne), l'essai,
+  la variante testée ou le document diffèrent, ou si l'un est une observation qui
+  illustre l'autre.
+- NON si les défaillances ou les mécanismes diffèrent, même avec une référence
+  d'essai, un document, une matière ou un thème en commun. Exemple en formulation :
+  homogénéité du mélange, stabilité au stockage, pH, formation ou maintien du film,
+  séchage, couleur et prise sont des problèmes différents.
+- En cas de doute, NON.
+Réponds uniquement en JSON : {"same_problem": true ou false, "reason": "raison courte"}
+""".strip()
+
+GROUP_STATEMENT_SYSTEM = """
+Tu reçois un groupe de candidats verrous d'un même dossier R&D. La comparaison par
+paires les a jugés comme formulations ou manifestations d'UNE MÊME incertitude
+technique (un groupe peut ne contenir qu'un candidat).
+Rédige UN énoncé technique qui exprime fidèlement ce problème commun :
+- uniquement à partir des énoncés et des preuves fournis ;
+- n'ajoute aucune cause, conséquence, difficulté, valeur, matière ou référence absente ;
+- garde les objets techniques, matières, références d'essais et valeurs utiles ;
+- une ou deux phrases, sans guillemets de citation ni formule du type « le passage indique » ;
+- ne juge pas si c'est un verrou éligible.
+Réponds uniquement en JSON : {"statement": "..."}
+""".strip()
+
+
+def _pairwise_enabled() -> bool:
+    return os.getenv("ENNOSMART_DIAGNOSTIC_PAIRWISE_GROUPING", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 _EXPLICIT_LOCK_MARKERS = [
@@ -537,7 +583,8 @@ def _similarity_tokens(entity: CanonicalEntity) -> Dict[str, int]:
     return counts
 
 
-def _candidate_pairs(groups: List[CanonicalEntity]) -> List[tuple]:
+def _candidate_pairs(groups: List[CanonicalEntity], *, neighbors: int = NEIGHBORS_PER_GROUP,
+                     max_pairs: int = MAX_CANDIDATE_PAIRS) -> List[tuple]:
     """Paires de groupes à comparer (indices i < j).
 
     Jusqu'à FULL_PAIRS_MAX paires : toutes. Au-delà, chaque groupe est comparé
@@ -572,18 +619,23 @@ def _candidate_pairs(groups: List[CanonicalEntity]) -> List[tuple]:
     chosen = set()
     for i in range(n):
         ranked = sorted(((similarity[(min(i, j), max(i, j))], j) for j in range(n) if j != i), reverse=True)
-        for score, j in ranked[:NEIGHBORS_PER_GROUP]:
+        for score, j in ranked[:neighbors]:
             if score > 0.0:
                 chosen.add((min(i, j), max(i, j)))
-    if len(chosen) > MAX_CANDIDATE_PAIRS:
-        chosen = set(sorted(chosen, key=lambda pair: similarity[pair], reverse=True)[:MAX_CANDIDATE_PAIRS])
+    if len(chosen) > max_pairs:
+        chosen = set(sorted(chosen, key=lambda pair: similarity[pair], reverse=True)[:max_pairs])
     return sorted(chosen)
 
 
 class GlobalLockConsolidator:
-    def __init__(self, llm: LLMClientProtocol, *, require_intergroup=False):
+    def __init__(self, llm: LLMClientProtocol, *, require_intergroup=False, pairwise: Optional[bool] = None,
+                 verifier_llm: Optional[LLMClientProtocol] = None):
         self.llm = llm
         self.require_intergroup = require_intergroup
+        # ENNOSMART_DIAGNOSTIC_PAIRWISE_GROUPING=0 rétablit la partition globale.
+        self.pairwise = _pairwise_enabled() if pairwise is None else bool(pairwise)
+        # Modèle plus fort qui revérifie les seules paires jugées « même problème ».
+        self.verifier_llm = verifier_llm
         self.debug_sink = None
         self.last_payload = None
 
@@ -592,6 +644,8 @@ class GlobalLockConsolidator:
         self.last_payload = None
         record(self, "consolidation.input_items", [asdict(i) for i in items if i.kind == "lock"])
         compact, expansion = self._compact_exact_fast_facts(items) if self.require_intergroup else (items, {})
+        if self.pairwise and self.require_intergroup:
+            return self._consolidate_pairwise(compact, expansion, items)
         groups = self._consolidate_initial(compact)
         if expansion:
             expanded = []
@@ -675,7 +729,220 @@ is_experimental_attempt, targets_parent_problem et shows_parent_persistence vrai
         record(self, "consolidation.final_groups", [asdict(e) for e in result])
         return result
 
-    def _batched_intergroup(self, groups, items):
+    def _consolidate_pairwise(self, compact, expansion, items):
+        """Chaque candidat part seul ; deux groupes ne se réunissent que si toutes
+        leurs paires de membres sont jugées « même problème », chacune seule.
+
+        Les passages d'un même fait restent ensemble (sérialisation sans perte),
+        les verrous numérotés d'une même source restent séparés. Une paire non
+        jugée, invalide ou en doute empêche la fusion.
+        """
+        groups = []
+        for item in compact:
+            if item.kind != "lock":
+                continue
+            originals = expansion.get(item.item_id) or [item]
+            parts = [[o] for o in originals] if _cluster_violates_explicit_separation(originals) else [originals]
+            for members in parts:
+                evidences = _dedupe_evidence([o.evidence for o in members])
+                groups.append(CanonicalEntity(
+                    entity_id=_entity_id(members[0].statement), kind="lock", statement=members[0].statement,
+                    source_item_ids=[o.item_id for o in members], evidences=evidences,
+                    document_ids=sorted({e.document_id for e in evidences}),
+                    needs_review=any(o.needs_review for o in members),
+                    metadata={"consolidation": "pairwise", "source_count": len(members),
+                              "document_count": len({e.document_id for e in evidences}),
+                              **_provenance_metadata(members)},
+                ))
+        record(self, "consolidation.preliminary_groups", [asdict(e) for e in groups])
+        if len(groups) >= 2:
+            groups = self._complete_link_groups(groups, items)
+        result = self._write_group_statements(groups, items)
+        record(self, "consolidation.final_groups", [asdict(e) for e in result])
+        return result
+
+    @staticmethod
+    def _pair_side(entity: CanonicalEntity) -> str:
+        return json.dumps({"enonce": clip(entity.statement, 420), "citations": [
+            {"document": clip(ev.document_name, 60), "citation": clip(ev.quote, 260)} for ev in entity.evidences[:2]]},
+            ensure_ascii=False, sort_keys=True)
+
+    def _judge_pairs(self, groups, pairs, llm=None) -> Dict[tuple, Dict[str, object]]:
+        """Une question par paire, avec les deux seuls candidats ; ordre A/B fixé par le contenu."""
+        llm = llm or self.llm
+        sides = {}
+
+        def prompt_for(pair):
+            a, b = sorted((sides.setdefault(i, self._pair_side(groups[i])) for i in pair))
+            return '{"CANDIDAT_A": ' + a + ', "CANDIDAT_B": ' + b + "}"
+
+        def judge(llm, pair):
+            prompt = prompt_for(pair)
+            for _ in range(2):
+                try:
+                    payload = parse_json_payload(llm.extract_json(PAIR_SYSTEM, prompt))
+                    same = payload.get("same_problem") if isinstance(payload, dict) else None
+                    if isinstance(same, bool):
+                        return {"same": same, "reason": clip((payload or {}).get("reason"), 240)}
+                except Exception:
+                    pass
+            return {"same": None, "reason": "reponse_invalide"}
+
+        pairs = list(pairs)
+        for pair in pairs:
+            for i in pair:
+                sides.setdefault(i, self._pair_side(groups[i]))
+        if not pairs:
+            return {}
+        workers = min(PAIRWISE_WORKERS, len(pairs))
+        fork = getattr(llm, "fork", None)
+        clients = [fork() for _ in range(workers)] if workers > 1 and callable(fork) else []
+        if clients and all(client is not None for client in clients):
+            slices = [pairs[k::workers] for k in range(workers)]
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="diagnostic-pairs") as pool:
+                chunks = list(pool.map(lambda job: [(p, judge(job[0], p)) for p in job[1]], zip(clients, slices)))
+            return {pair: verdict for chunk in chunks for pair, verdict in chunk}
+        return {pair: judge(llm, pair) for pair in pairs}
+
+    def _verify_same(self, groups, judged, pairs, stats) -> None:
+        """Une paire jugée « même problème » n'est retenue que si le modèle plus fort le confirme."""
+        same = [pair for pair in pairs if judged[pair]["same"] is True]
+        if not same or self.verifier_llm is None:
+            return
+        verdicts = self._judge_pairs(groups, same, llm=self.verifier_llm)
+        for pair in same:
+            check = verdicts.get(pair) or {"same": None, "reason": "verification_absente"}
+            stats["verified"] += 1
+            if check["same"] is not True:
+                stats["rejected"] += 1
+                judged[pair] = {"same": False if check["same"] is False else None,
+                                "reason": judged[pair]["reason"], "rejected_by_verifier": check["reason"]}
+            else:
+                judged[pair] = {**judged[pair], "verified": check["reason"]}
+
+    def _complete_link_groups(self, groups, items) -> List[CanonicalEntity]:
+        """Fusion en lien complet : tous les membres de deux groupes doivent être jugés « même problème »."""
+        original = {item.item_id: item for item in items}
+        # Ordre fixé par le contenu : les paires choisies ne dépendent pas de la position des candidats.
+        groups = sorted(groups, key=lambda g: hashlib.sha1(self._pair_side(g).encode("utf-8")).hexdigest())
+        candidates = _candidate_pairs(groups, neighbors=PAIRWISE_NEIGHBORS, max_pairs=PAIRWISE_MAX_PAIRS)
+        judged = self._judge_pairs(groups, candidates)
+        stats = {"verified": 0, "rejected": 0}
+        self._verify_same(groups, judged, candidates, stats)
+        side = {i: self._pair_side(g) for i, g in enumerate(groups)}
+        # Ordre fixé par le contenu, pas par l'ordre des candidats.
+        edges = sorted((pair for pair, verdict in judged.items() if verdict["same"] is True),
+                       key=lambda p: hashlib.sha1("|".join(sorted((side[p[0]], side[p[1]]))).encode("utf-8")).hexdigest())
+        root = list(range(len(groups)))
+        members = {i: [i] for i in range(len(groups))}
+
+        def find(i):
+            while root[i] != i:
+                root[i] = root[root[i]]
+                i = root[i]
+            return i
+
+        completion = invalid = 0
+        for a, b in edges:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                continue
+            cross = [(min(x, y), max(x, y)) for x in members[ra] for y in members[rb]]
+            if any(judged.get(c, {}).get("same") is False for c in cross):
+                continue
+            unknown = [c for c in cross if c not in judged]
+            if unknown:
+                if completion + len(unknown) > PAIRWISE_MAX_COMPLETION:
+                    continue
+                judged.update(self._judge_pairs(groups, unknown))
+                self._verify_same(groups, judged, unknown, stats)
+                completion += len(unknown)
+            if not all(judged[c]["same"] is True for c in cross):
+                continue
+            source = [original[i] for g in members[ra] + members[rb] for i in groups[g].source_item_ids if i in original]
+            if _cluster_violates_explicit_separation(source):
+                continue
+            root[rb] = ra
+            members[ra] = members[ra] + members.pop(rb)
+        invalid = sum(1 for verdict in judged.values() if verdict["same"] is None)
+
+        output = []
+        for r in sorted(members, key=lambda k: min(members[k])):
+            parts = [groups[g] for g in sorted(members[r])]
+            principal = groups[max(members[r], key=lambda g: (len(groups[g].source_item_ids), side[g]))]
+            item_ids = [i for g in parts for i in g.source_item_ids]
+            evidences = _dedupe_evidence([ev for g in parts for ev in g.evidences])
+            reasons = [{"pair": [groups[x].entity_id, groups[y].entity_id], "reason": judged[(x, y)]["reason"]}
+                       for x, y in itertools.combinations(sorted(members[r]), 2) if (x, y) in judged]
+            output.append(replace(principal, source_item_ids=item_ids, evidences=evidences,
+                document_ids=sorted({ev.document_id for ev in evidences}),
+                needs_review=any(g.needs_review for g in parts),
+                metadata={**principal.metadata, "consolidation": "pairwise", "source_count": len(item_ids),
+                          "document_count": len({ev.document_id for ev in evidences}),
+                          "merged_group_ids": [g.entity_id for g in parts], "pair_reasons": reasons[:20],
+                          **_provenance_metadata([original[i] for i in item_ids if i in original])}))
+        before = {i for g in groups for i in g.source_item_ids}
+        after = [i for e in output for i in e.source_item_ids]
+        if before != set(after) or len(after) != len(before):
+            raise ValueError("pairwise_item_coverage_lost")
+        print(f"[EnnoDiagnostic][Consolidation] par paires : {len(groups)} candidats -> {len(output)} verrous "
+              f"({len(candidates)} paires jugees + {completion} de controle, {invalid} reponse(s) invalide(s), "
+              f"{stats['verified']} fusion(s) reverifiee(s), {stats['rejected']} refusee(s))", flush=True)
+        return output
+
+    def _write_group_statements(self, groups: List[CanonicalEntity], items) -> List[CanonicalEntity]:
+        """Un énoncé par verrou, rédigé à partir de ses seuls membres (même groupe, même énoncé).
+
+        En cas d'échec ou de réponse invalide, l'énoncé du membre principal est gardé.
+        """
+        by_id = {item.item_id: item for item in items}
+
+        def prompt_for(entity):
+            members = entity.metadata["member_statements"]
+            return json.dumps({
+                "CANDIDATS": [clip(s, 420) for s in members[:12]],
+                "PREUVES": [{"document": clip(ev.document_name, 60), "quote": clip(ev.quote, 240)}
+                            for ev in entity.evidences[:6]],
+            }, ensure_ascii=False)
+
+        def request(job):
+            llm, entity = job
+            try:
+                payload = parse_json_payload(llm.extract_json(GROUP_STATEMENT_SYSTEM, prompt_for(entity)))
+                statement = " ".join(str((payload or {}).get("statement") or "").split())
+                return statement if 15 <= len(statement) <= 700 else ""
+            except Exception:
+                return ""
+
+        if not groups:
+            return []
+        # Énoncés d'origine des membres, pour la rédaction et la traçabilité.
+        prepared = []
+        for entity in groups:
+            members = list(dict.fromkeys(
+                by_id[i].statement for i in entity.source_item_ids if i in by_id and by_id[i].statement)) or [entity.statement]
+            prepared.append(replace(entity, metadata={**entity.metadata, "member_statements": members}))
+        workers = min(PAIRWISE_WORKERS, len(prepared))
+        fork = getattr(self.llm, "fork", None)
+        clients = [fork() for _ in prepared] if workers > 1 and callable(fork) else []
+        if clients and all(client is not None for client in clients):
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="diagnostic-statement") as pool:
+                written = list(pool.map(request, zip(clients, prepared)))
+        else:
+            written = [request((self.llm, entity)) for entity in prepared]
+        output, used = [], set()
+        for entity, statement in zip(prepared, written):
+            final = statement or entity.statement
+            entity_id = _entity_id(final)
+            if entity_id in used:
+                entity_id = _entity_id(final + "|" + ",".join(sorted(entity.source_item_ids)))
+            used.add(entity_id)
+            output.append(replace(entity, entity_id=entity_id, statement=final, metadata={
+                **entity.metadata, "statement_source": "group_synthesis" if statement else "principal_member"}))
+        return output
+
+    def _batched_intergroup(self, groups, items, *, neighbors=NEIGHBORS_PER_GROUP,
+                            max_pairs=MAX_CANDIDATE_PAIRS, workers=None):
         """Compare les groupes par petits lots et applique les relations valides.
 
         Une réponse incomplète ou une ligne invalide ne fait plus rejeter toute
@@ -683,9 +950,9 @@ is_experimental_attempt, targets_parent_problem et shows_parent_persistence vrai
         reste simplement non fusionnée, et toute paire DISTINCT_LOCK reste une
         contrainte forte sur les fusions.
         """
-        pairs = _candidate_pairs(groups)
+        pairs = _candidate_pairs(groups, neighbors=neighbors, max_pairs=max_pairs)
         total = len(groups) * (len(groups) - 1) // 2
-        rows, calls, failed = self._evaluate_pairs(groups, pairs)
+        rows, calls, failed = self._evaluate_pairs(groups, pairs, workers=workers)
 
         # Contrôle des chaînes : A≈B et B≈C ne doivent pas fusionner A et C sans
         # que la paire (A, C) ait été jugée. Les paires internes non évaluées
@@ -713,12 +980,12 @@ is_experimental_attempt, targets_parent_problem et shows_parent_persistence vrai
             completion_pairs = []
         completion_pairs = completion_pairs[:MAX_COMPLETION_PAIRS]
         if completion_pairs:
-            extra_rows, extra_calls, extra_failed = self._evaluate_pairs(groups, completion_pairs)
+            extra_rows, extra_calls, extra_failed = self._evaluate_pairs(groups, completion_pairs, workers=workers)
             rows, calls, failed = rows + extra_rows, calls + extra_calls, failed + extra_failed
         return self._apply_batched_rows(groups, items, rows, pairs, total, calls, failed,
                                         len(completion_pairs))
 
-    def _evaluate_pairs(self, groups, pairs):
+    def _evaluate_pairs(self, groups, pairs, *, workers=None):
         """Soumet des paires de groupes au modèle par lots ; renvoie les lignes valides."""
         system = INTERGROUP_BATCH_SYSTEM
         budget = content_char_budget(self.llm, system)
@@ -754,7 +1021,7 @@ is_experimental_attempt, targets_parent_problem et shows_parent_persistence vrai
 
         # Lots indépendants : en parallèle, chacun avec son propre client
         # (même règle que les étapes post-core du pipeline).
-        workers = min(diagnostic_workers(), len(prepared))
+        workers = min(workers or diagnostic_workers(), len(prepared))
         fork = getattr(self.llm, "fork", None)
         clients = [fork() for _ in prepared] if workers > 1 and callable(fork) else []
         if clients and all(client is not None for client in clients):
