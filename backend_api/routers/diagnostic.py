@@ -27,6 +27,8 @@ from services import diagnostic_service as diagnostic_service_module
 from services.consultant_verrou_service import (
     create_or_reuse_consultant_verrou,
     get_latest_diagnostic_verrous,
+    get_project_manual_verrous,
+    merge_current_and_manual_verrous,
 )
 from services.diagnostic_service import (
     create_diagnostic_run_from_files,
@@ -2118,78 +2120,7 @@ def compare_document_pair(
 
 
 
-def _current_v2_verrous_for_cir_memory(db: Session, project_id: int) -> list[dict[str, Any]]:
-    """Vue sérialisée des verrous PostgreSQL du diagnostic courant.
-
-    Les ``source_json`` V2 conservent l'entité native et ses preuves ; CIR_MEMORY
-    peut donc comparer les verrous sans relire l'ancien nlp_result.json.
-    """
-    rows = get_latest_diagnostic_verrous(db, project_id)
-    out: list[dict[str, Any]] = []
-    for row in rows or []:
-        source_json = row.source_json if isinstance(row.source_json, dict) else {}
-        out.append(
-            sanitize_json_value(
-                {
-                    "id": row.id,
-                    "verrou_id": row.id,
-                    "title": row.title,
-                    "tag_cir": row.tag_cir,
-                    "score": row.score,
-                    "consultant_status": row.consultant_status,
-                    "justification": row.justification,
-                    "source_json": source_json,
-                    "qualification_status": source_json.get("qualification_status"),
-                }
-            )
-        )
-    return out
-
-
-def _current_v2_project_facts_for_cir_memory(db: Session, project_id: int) -> list[dict[str, Any]]:
-    report, _ = _extract_latest_run_report(_latest_run_for_project(db, project_id))
-    return diagnostic_service_module._extract_v2_project_facts_for_cir_memory(report)
-
-
 @router.post("/projects/{project_id}/diagnostic/cir-memory/compare")
-def compare_with_previous_cir(
-    project_id: int,
-    confirmed_cir_year: str | None = Query(default=None, pattern=r"^(19|20)\d{2}$"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Lance uniquement la comparaison avec le CIR précédent :
-    verrous EnnoDiagnostic V2 courants vs CIR final mémoire N-1.
-    """
-    project = get_project_for_user(db, project_id, current_user)
-
-    try:
-        from modules.CIR_MEMORY.cir_memory import compare_current_raw_with_cir_memory
-
-        current_verrous = _current_v2_verrous_for_cir_memory(db, project.id)
-        report = compare_current_raw_with_cir_memory(
-            organisme=project.organisme,
-            project=project.project_name,
-            year=str(project.year),
-            current_verrous=current_verrous,
-            current_project_facts=_current_v2_project_facts_for_cir_memory(db, project.id),
-            project_id=project.id, confirmed_cir_year=confirmed_cir_year,
-            subproject=str(getattr(project, "subproject_name", "") or "").strip(),
-        )
-
-        return sanitize_json_value(report)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Comparaison CIR précédent impossible : {exc}",
-        )
-
-
-
-
 @router.post("/projects/{project_id}/cir-previous/compare-current")
 def compare_current_with_previous_cir_independent(
     project_id: int,
@@ -2202,26 +2133,48 @@ def compare_current_with_previous_cir_independent(
 
     Cette route ne lance pas EnnoDiagnostic, ne relance pas le LLM diagnostic,
     ne relance pas le score IA et ne refait pas le NLP.
-    Elle compare les faits qualifiés avec l’historique scientifique. Les
-    rédactions historiques ciblées sont réutilisées lorsqu’elles sont validées en cache.
+    Elle compare les faits projet V2 et les verrous qualifiés avec la mémoire CIR N-1.
     """
     project = get_project_for_user(db, project_id, current_user)
 
     try:
-        from modules.CIR_MEMORY.cir_memory import compare_current_raw_with_cir_memory
+        from modules.CIR_MEMORY.cir_memory import grouped_verrous_to_current_items, project_facts_to_current_items
+        from services.cir_n_minus_one_service import load_previous_cir, save_comparison
 
-        current_verrous = _current_v2_verrous_for_cir_memory(db, project.id)
-        report = compare_current_raw_with_cir_memory(
-            organisme=project.organisme,
-            project=project.project_name,
-            year=str(project.year),
-            current_verrous=current_verrous,
-            current_project_facts=_current_v2_project_facts_for_cir_memory(db, project.id),
-            project_id=project.id, confirmed_cir_year=confirmed_cir_year,
-            subproject=str(getattr(project, "subproject_name", "") or "").strip(),
+        run = (
+            db.query(DiagnosticRun)
+            .filter(DiagnosticRun.project_id == project.id, DiagnosticRun.status.like("completed%"),
+                    DiagnosticRun.raw_result_json.isnot(None))
+            .order_by(DiagnosticRun.created_at.desc(), DiagnosticRun.id.desc())
+            .first()
         )
-
-        return sanitize_json_value(report)
+        if run is None:
+            raise HTTPException(status_code=409, detail="Aucun diagnostic terminé n’est disponible pour la comparaison CIR.")
+        report, _ = _extract_latest_run_report(run)
+        if not report:
+            raise HTTPException(status_code=409, detail="Le rapport du diagnostic terminé est indisponible.")
+        rows = db.query(Verrou).filter_by(diagnostic_run_id=run.id).order_by(Verrou.id).all()
+        rows = merge_current_and_manual_verrous(rows, get_project_manual_verrous(db, project.id))
+        verrous = [sanitize_json_value({
+            "id": row.id, "title": row.title, "tag_cir": row.tag_cir, "score": row.score,
+            "consultant_status": row.consultant_status, "justification": row.justification, "source_json": row.source_json,
+        }) for row in rows]
+        facts = diagnostic_service_module._extract_v2_project_facts_for_cir_memory(report)
+        items = grouped_verrous_to_current_items(verrous) + project_facts_to_current_items(facts)
+        from services.cir_n_minus_one_service import check_fiscal_year
+        chronology = check_fiscal_year(db, project, items, confirmed_cir_year)
+        if chronology["status"] == "CIR_YEAR_CONFIRMATION_REQUIRED":
+            return save_comparison(project, run.id, items, [], [], chronology["status"], year_check=chronology)
+        registered, passages, error = load_previous_cir(db, project, chronology["effective_year"])
+        if error == "historical_search_unavailable" and not passages:
+            raise HTTPException(status_code=503, detail="La lecture de l’historique Chroma a échoué. Réessayez la comparaison.")
+        from agents.EnnoDiagnostic.V2.ennodiagnostic_v2.runtime_adapters import EnnoSmartLLMAdapter
+        narration_llm = EnnoSmartLLMAdapter(
+            request_name="ennodiagnostic:v2:cir_comparison_narration",
+            temperature=0.0,
+            max_output_tokens=6000,
+        )
+        return save_comparison(project, run.id, items, registered, passages, error, year_check=chronology, llm=narration_llm)
     except HTTPException:
         raise
     except Exception as exc:
@@ -2882,7 +2835,7 @@ def upload_previous_cir_final(
     ensure_ennosmart_imports()
 
     try:
-        from modules.CIR_MEMORY.cir_memory import cir_final_dir, cir_final_report_path, compare_current_raw_with_cir_memory, write_json
+        from modules.CIR_MEMORY.cir_memory import cir_final_dir, cir_final_report_path, write_json
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Module CIR_MEMORY indisponible : {exc}")
 
@@ -2959,34 +2912,6 @@ def upload_previous_cir_final(
         "items": items,
     }))
 
-    comparison = None
-    try:
-        current_verrous = _current_v2_verrous_for_cir_memory(db, project.id)
-        current_project_facts = _current_v2_project_facts_for_cir_memory(db, project.id)
-        if current_verrous or current_project_facts:
-            comparison = compare_current_raw_with_cir_memory(
-                organisme=project.organisme,
-                project=project.project_name,
-                year=str(project.year),
-                current_verrous=current_verrous,
-                current_project_facts=current_project_facts,
-                project_id=project.id,
-                subproject=subproject,
-            )
-        else:
-            comparison = {
-                "ok": True,
-                "has_previous_cir": True,
-                "comparison_deferred": True,
-                "message": "CIR précédent enregistré. Lancez EnnoDiagnostic V2 pour comparer les verrous courants.",
-            }
-    except Exception as exc:
-        comparison = {
-            "ok": False,
-            "error": str(exc),
-            "note": "Le CIR précédent est enregistré. Relancez EnnoDiagnostic V2 pour recalculer la comparaison.",
-        }
-
     return sanitize_json_value({
         "ok": True,
         "message": "CIR final précédent enregistré comme mémoire CIR.",
@@ -2995,7 +2920,7 @@ def upload_previous_cir_final(
         "report_path": str(out_path),
         "items_count": len(items),
         "roles": _roles_count(items),
-        "comparison_after_upload": comparison,
+        "comparison_after_upload": {"ok": True, "has_previous_cir": True, "comparison_deferred": True},
     })
 
 
@@ -3009,14 +2934,9 @@ def list_previous_cir_finals(
     ensure_ennosmart_imports()
 
     try:
-        from modules.CIR_MEMORY.cir_memory import list_available_previous_cirs
+        from services.cir_n_minus_one_service import load_previous_cir
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Module CIR_MEMORY indisponible : {exc}")
 
-    subproject = str(getattr(project, "subproject_name", "") or "").strip()
-    items = list_available_previous_cirs(
-        project.organisme, project.project_name, str(project.year),
-        subproject=subproject, project_id=project.id,
-    )
-
-    return sanitize_json_value({"ok": True, "items": items})
+    items, _, error = load_previous_cir(db, project)
+    return sanitize_json_value({"ok": error is None, "items": items, "status": error or "ready"})

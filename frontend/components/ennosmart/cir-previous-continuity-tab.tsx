@@ -19,6 +19,12 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   SourceTextWithDocuments,
   useProjectSourceDocuments,
   type SourceEvidence,
@@ -506,6 +512,203 @@ function EvidencePanel({
   )
 }
 
+type CitationPair = {
+  current?: Record<string, any>
+  historical?: Record<string, any>
+}
+
+function citationPairSide(pair: CitationPair, side: "current" | "historical"): {
+  text: string
+  evidence: SourceEvidence[]
+} {
+  const value = pair?.[side] || {}
+  const text = cleanText(value.quote || value.excerpt || value.text || "Aucun extrait disponible.")
+  const evidence = [toEvidence({ ...value, excerpt: text }, text)].filter(Boolean) as SourceEvidence[]
+  return { text, evidence }
+}
+
+function CitationPairDialog({
+  open,
+  onOpenChange,
+  pair,
+  index,
+  itemYear,
+  projectId,
+  documents,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  pair: CitationPair | null
+  index: number | null
+  itemYear: string
+  projectId: number | string
+  documents: ReturnType<typeof useProjectSourceDocuments>
+}) {
+  if (!pair) return null
+  const previous = citationPairSide(pair, "historical")
+  const current = citationPairSide(pair, "current")
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>Citation [{index}]</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-4 md:grid-cols-2">
+          <EvidencePanel
+            title={`Extrait ciblé du CIR ${itemYear}`}
+            subtitle="CIR précédent"
+            projectId={projectId}
+            passage={previous.text}
+            evidence={previous.evidence}
+            documents={documents}
+            tone="previous"
+          />
+          <EvidencePanel
+            title="Passage du dossier courant"
+            subtitle="Dossier actuel"
+            projectId={projectId}
+            passage={current.text}
+            evidence={current.evidence}
+            documents={documents}
+            tone="current"
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function NarrativeWithCitations({
+  text,
+  onOpenCitation,
+}: {
+  text: string
+  onOpenCitation: (index: number) => void
+}) {
+  const parts = text.split(/(\[\d+\])/g)
+  return (
+    <p className="text-sm leading-7 text-foreground">
+      {parts.map((part, position) => {
+        const match = part.match(/^\[(\d+)\]$/)
+        if (!match) return <span key={position}>{part}</span>
+        const index = Number(match[1])
+        return (
+          <button
+            key={position}
+            type="button"
+            onClick={() => onOpenCitation(index)}
+            className="mx-0.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full border border-brand/40 bg-brand/10 px-1 text-[11px] font-semibold text-brand hover:bg-brand/20"
+          >
+            {index}
+          </button>
+        )
+      })}
+    </p>
+  )
+}
+
+function newCirComparisonShape(item: any): boolean {
+  return Array.isArray(item?.citation_pairs)
+}
+
+const citationDecisionLabels: Record<string, string> = {
+  A_VALIDER: "Citation à valider",
+  NO_SUPPORTED_MATCH: "Aucune citation retrouvée",
+  NO_VERIFIED_EVIDENCE: "Preuve actuelle non vérifiée",
+}
+
+function CitationComparisonCard({
+  item,
+  itemYear,
+  projectId,
+  documents,
+}: {
+  item: any
+  itemYear: string
+  projectId: number | string
+  documents: ReturnType<typeof useProjectSourceDocuments>
+}) {
+  const current = item.current_item || {}
+  const pairs: CitationPair[] = asArray(item.citation_pairs)
+  const narrative = item.narrative?.text ? cleanText(item.narrative.text) : ""
+  const [openIndex, setOpenIndex] = useState<number | null>(null)
+  const selectedPair = openIndex ? pairs[openIndex - 1] || null : null
+
+  return (
+    <Card>
+      <CardHeader className="space-y-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 space-y-1">
+            <CardTitle className="text-base leading-6">
+              {cleanText(current.section_title) || "Élément courant"}
+            </CardTitle>
+            <CardDescription className="text-xs">
+              Comparaison CIR {itemYear} / dossier courant
+            </CardDescription>
+          </div>
+          <Badge variant="outline">
+            {citationDecisionLabels[item.decision?.status] || "À valider"}
+          </Badge>
+        </div>
+        <Badge variant="outline" className="w-fit">
+          {categoryLabels[current.kind || "lock"] || "Élément projet"}
+        </Badge>
+      </CardHeader>
+
+      <CardContent className="space-y-4">
+        {narrative ? (
+          <div className="rounded-xl border border-blue-200 bg-blue-50/60 p-4">
+            <div className="flex items-start gap-3">
+              <ShieldCheck className="mt-0.5 size-4 shrink-0 text-blue-700" />
+              <div className="space-y-1">
+                <p className="text-xs font-semibold uppercase tracking-wide text-blue-800">
+                  Évolution par rapport au CIR {itemYear}
+                </p>
+                <NarrativeWithCitations text={narrative} onOpenCitation={setOpenIndex} />
+              </div>
+            </div>
+          </div>
+        ) : pairs.length > 0 ? (
+          <div className="space-y-2">
+            <p className="text-sm text-muted-foreground">
+              Passages retrouvés pour ce point (citations non rédigées) :
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {pairs.map((_, position) => (
+                <Button
+                  key={position}
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setOpenIndex(position + 1)}
+                >
+                  Citation [{position + 1}]
+                </Button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {item.decision?.status === "NO_VERIFIED_EVIDENCE"
+              ? "Ce point n’a pas encore de preuve vérifiée dans le dossier courant."
+              : "Aucun passage du CIR précédent ne correspond avec certitude à ce point."}
+          </p>
+        )}
+      </CardContent>
+
+      <CitationPairDialog
+        open={openIndex !== null}
+        onOpenChange={(open) => !open && setOpenIndex(null)}
+        pair={selectedPair}
+        index={openIndex}
+        itemYear={itemYear}
+        projectId={projectId}
+        documents={documents}
+      />
+    </Card>
+  )
+}
+
 function ContextualPassageComparison({report, projectId, documents}: {
   report: any; projectId: number | string; documents: ReturnType<typeof useProjectSourceDocuments>
 }) {
@@ -799,6 +1002,17 @@ export default function CirPreviousContinuityTab({
       <div className="space-y-4">
         {visibleComparisons.length === 0 && <p className="text-sm text-muted-foreground">Aucun élément à comparer dans cette rubrique.</p>}
         {visibleComparisons.map((item, index) => {
+          if (newCirComparisonShape(item)) {
+            return (
+              <CitationComparisonCard
+                key={String(item.current_item?.id ?? index)}
+                item={item}
+                itemYear={previousYear(report, item)}
+                projectId={projectId}
+                documents={documents}
+              />
+            )
+          }
           const current = currentItem(item)
           const previous = previousCandidate(item)
           const currentEvidence = collectEvidence(current, current?.display_excerpt || current?.text)
