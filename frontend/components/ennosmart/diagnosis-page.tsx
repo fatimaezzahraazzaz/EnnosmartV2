@@ -5337,12 +5337,14 @@ export function DiagnosisPage(
   const cirMemoryContinuities = firstNonEmptyArray(display?.cir_memory_continuities, cirMemory?.continuity_strong)
   // Un tableau vide est truthy en JavaScript : utiliser || masquait donc les
   // comparaisons réellement remplies par comparison-latest.
+  // Un clic sur "Lancer la comparaison" doit toujours l'emporter sur une comparaison
+  // plus ancienne deja presente dans le rapport de diagnostic principal.
   const cirMemoryComparisons = firstNonEmptyArray(
+    unwrapCirPreviousReportForDisplay(previousCirComparisonReport)?.comparisons,
+    unwrapCirPreviousReportForDisplay(previousCirComparisonReport)?.verrou_comparisons,
     cirMemory?.comparisons,
     display?.cir_memory_verrou_comparisons,
-    cirMemory?.verrou_comparisons,
-    unwrapCirPreviousReportForDisplay(previousCirComparisonReport)?.verrou_comparisons,
-    unwrapCirPreviousReportForDisplay(previousCirComparisonReport)?.comparisons
+    cirMemory?.verrou_comparisons
   )
 
   // V156 - Le CIR précédent peut être détecté par plusieurs sources :
