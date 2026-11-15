@@ -799,7 +799,19 @@ export default function CirPreviousContinuityTab({
     confirmationRequest.current += 1
     setConfirmedReport(null); setYearError(""); setManualYear(""); setConfirmingYear(false)
   }, [savedReport, projectId])
-  const report = useMemo(() => confirmedReport || unwrapReport(diagnostic), [diagnostic, confirmedReport])
+  const savedReportUnwrapped = useMemo(() => unwrapReport(savedReport), [savedReport])
+  const diagnosticUnwrapped = useMemo(() => unwrapReport(diagnostic), [diagnostic])
+  const hasSavedReportContent = Boolean(
+    savedReportUnwrapped?.comparison_status ||
+    asArray(savedReportUnwrapped?.comparisons).length > 0 ||
+    asArray(savedReportUnwrapped?.verrou_comparisons).length > 0,
+  )
+  // A fresh POST response in savedReport (e.g. after "Lancer la comparaison") must take
+  // priority over the diagnostic prop, which only carries the previously saved/embedded report.
+  const report = useMemo(
+    () => confirmedReport || (hasSavedReportContent ? savedReportUnwrapped : diagnosticUnwrapped),
+    [confirmedReport, hasSavedReportContent, savedReportUnwrapped, diagnosticUnwrapped],
+  )
   const comparisons = useMemo(() => comparisonList(report), [report])
   const [selectedCategory, setSelectedCategory] = useState("all")
   useEffect(() => { setSelectedCategory("all") }, [projectId])
