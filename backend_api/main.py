@@ -52,6 +52,7 @@ from routers import scholar_v66
 from routers import cir_final_consultant
 from routers import cir_memory
 from routers import improvement
+from routers import amelioration_v2
 from routers import admin
 from routers import sharepoint_audit
 
@@ -114,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(cir_final_consultant.router)
     app.include_router(cir_memory.router)
     app.include_router(improvement.router)
+    app.include_router(amelioration_v2.router)
     app.include_router(admin.router)
     app.include_router(sharepoint_audit.router)
 

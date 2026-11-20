@@ -105,6 +105,11 @@ const EnnoAmeliorationPage = dynamic(
   },
 )
 
+const EnnoAmeliorationV2Chat = dynamic(
+  () => import("@/components/ennosmart/ennoamelioration-v2-chat"),
+  { ssr: false, loading: agentPageLoading },
+)
+
 
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
@@ -123,6 +128,7 @@ export type AppPage =
   | "scholar"
   | "scholar-v66"
   | "improvement"
+  | "improvement-v2"
   | "profile"
   | "admin"
   | "cir-memory"
@@ -175,6 +181,7 @@ const baseNavItems = [
     label: "EnnoAmelioration",
     icon: FilePenLine,
   },
+  { id: "improvement-v2" as AppPage, label: "EnnoAmélioration V2", icon: FilePenLine },
 ]
 
 
@@ -191,6 +198,7 @@ const agentKeyForPage: Partial<Record<AppPage, keyof AgentAvailability>> = {
   scholar: "scholar",
   "scholar-v66": "scholar",
   improvement: "improvement",
+  "improvement-v2": "improvement",
   "cir-memory": "cir_memory",
 }
 
@@ -308,6 +316,9 @@ const pageDescriptions:
 
     improvement:
       "Amélioration guidée des livrables CIR",
+
+    "improvement-v2":
+      "Points faibles et amélioration des dossiers CIR",
 
     admin:
       "Utilisateurs, rôles et supervision",
@@ -547,6 +558,7 @@ export default function AppShell({
               "scholar",
               "scholar-v66",
               "improvement",
+              "improvement-v2",
             ]),
           },
           {
@@ -578,6 +590,7 @@ export default function AppShell({
               "scholar",
               "scholar-v66",
               "improvement",
+              "improvement-v2",
             ]),
           },
         ]
@@ -599,6 +612,7 @@ export default function AppShell({
             "scholar",
             "scholar-v66",
             "improvement",
+            "improvement-v2",
           ]),
         },
       ]
@@ -879,6 +893,11 @@ export default function AppShell({
             }
           />
         ) : null
+
+      case "improvement-v2":
+        return enabledAgents.improvement !== false
+          ? <EnnoAmeliorationV2Chat userId={user.id} showBudget={user.role === "superadmin"} />
+          : null
 
 
       case "profile":
@@ -1600,7 +1619,10 @@ export default function AppShell({
   /*                             Header courant                               */
   /* ------------------------------------------------------------------------ */
 
-  const currentPageTitle =
+  // EnnoAmélioration V2 shows one title; its mode switch and actions fill the header slot.
+  const compactChatHeader = activePage === "improvement-v2"
+
+  const currentPageTitle = compactChatHeader ? "EnnoAmélioration" :
     navItems.find(
       (item) =>
         item.id === activePage,
@@ -1623,7 +1645,7 @@ export default function AppShell({
 
   return (
 
-    <div className={cn("flex overflow-hidden bg-background", activePage === "scholar-v66" ? "h-dvh" : "h-screen")}>
+    <div className={cn("flex overflow-hidden bg-background", activePage === "scholar-v66" || activePage === "improvement-v2" ? "h-dvh" : "h-screen")}>
 
       {/* Accessibilité */}
 
@@ -1769,6 +1791,7 @@ export default function AppShell({
               lg:px-8
             `,
             activePage === "diagnosis" && "h-auto min-h-[76px] py-2.5",
+            compactChatHeader && "h-14 gap-2 sm:px-4 lg:px-5",
             workspaceImmersive &&
               "lg:hidden",
           )}
@@ -1819,7 +1842,7 @@ export default function AppShell({
             </div>
 
 
-            <p
+            {!compactChatHeader && <p
               className="
                 mt-0.5
                 hidden
@@ -1836,9 +1859,12 @@ export default function AppShell({
                 ]
               }
 
-            </p>
+            </p>}
 
           </div>
+
+          {/* Actions placed here by the active page (createPortal). */}
+          <div id="page-header-actions" className="flex shrink-0 items-center gap-1.5 empty:hidden" />
 
 
           {/* Projet + utilisateur */}
@@ -2000,7 +2026,7 @@ export default function AppShell({
               flex-1
               bg-background
             `,
-            workspaceImmersive
+            workspaceImmersive || compactChatHeader
               ? "overflow-hidden"
               : "overflow-y-auto",
           )}
@@ -2014,7 +2040,7 @@ export default function AppShell({
                 min-w-0
                 animate-fadeIn
               `,
-              workspaceImmersive
+              workspaceImmersive || compactChatHeader
                 ? "h-full min-h-0 overflow-hidden"
                 : "min-h-full",
             )}
