@@ -21,7 +21,7 @@ class Service:
 
     def __init__(self, config=None, client=None, scholar=None):
         self.config = config or Config.from_env()
-        self.store = Store(self.config.data_dir)
+        self.store = Store(self.config.data_dir, stale_seconds=self.config.max_seconds + 120)
         self.store.interrupt_unfinished()
         self.agent = Agent(self.store, self.config, client, scholar or ScholarBridge())
         self.pool = ThreadPoolExecutor(max_workers=self.parallel_runs, thread_name_prefix="amelioration-v2")

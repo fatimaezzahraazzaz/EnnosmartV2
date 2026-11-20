@@ -52,9 +52,11 @@ MODES = ("amelioration", "expert")
 
 
 class Store:
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, stale_seconds=600):
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / "amelioration_v2.sqlite3"
+        # A run that has not reported for this long has lost its worker (restart, crash).
+        self.stale_seconds = stale_seconds
         with self.connect() as db:
             db.executescript(SCHEMA)
             # Conversations created before the expert mode existed.
@@ -273,6 +275,7 @@ class Store:
         return {**dict(row), **{k: json.loads(row[k]) for k in ("events", "warnings", "usage")}}
 
     def active_run(self, sid):
+        self.interrupt_unfinished()
         with self.connect() as db:
             row = db.execute("SELECT id FROM runs WHERE session=? AND status IN ('queued','running')", (sid,)).fetchone()
         return self.run(row["id"]) if row else None
@@ -289,9 +292,10 @@ class Store:
             db.execute("UPDATE runs SET cancelled=1 WHERE id=?", (rid,))
 
     def interrupt_unfinished(self):
-        """A restarted server cannot resume a thread; close those runs honestly."""
+        """Close runs whose worker is gone; runs still reporting (another server process) are left alone."""
         with self.connect() as db:
-            db.execute("UPDATE runs SET status='interrupted' WHERE status IN ('queued','running')")
+            db.execute("UPDATE runs SET status='interrupted' WHERE status IN ('queued','running') AND updated < ?",
+                       (time.time() - self.stale_seconds,))
 
     def session_cost(self, sid):
         with self.connect() as db:

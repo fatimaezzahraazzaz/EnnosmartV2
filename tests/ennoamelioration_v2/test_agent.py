@@ -141,3 +141,13 @@ def test_store_keeps_one_accepted_text_per_paragraph_and_one_active_run(config):
     assert {r["status"] for r in store.revisions(sid)} == {"obsolete"}
     with pytest.raises(ValueError, match="version précédente"):
         store.decide(sid, new["id"], "accepted")
+
+
+def test_a_second_server_process_does_not_interrupt_a_live_run(config):
+    store, sid, rid, _ = setup(config, FakeModel())
+    store.update_run(rid, status="running")
+    Store(config.data_dir, stale_seconds=600).interrupt_unfinished()  # another worker starting up
+    assert store.run(rid)["status"] == "running" and store.active_run(sid)["id"] == rid
+    with store.connect() as db:
+        db.execute("UPDATE runs SET updated = updated - 700 WHERE id=?", (rid,))
+    assert store.active_run(sid) is None and store.run(rid)["status"] == "interrupted"

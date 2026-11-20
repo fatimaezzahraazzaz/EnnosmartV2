@@ -176,12 +176,7 @@ const baseNavItems = [
     icon: BrainCircuit,
   },
   { id: "scholar-v66" as AppPage, label: "EnnoScholar", icon: BookOpen },
-  {
-    id: "improvement" as AppPage,
-    label: "EnnoAmelioration",
-    icon: FilePenLine,
-  },
-  { id: "improvement-v2" as AppPage, label: "EnnoAmélioration V2", icon: FilePenLine },
+  { id: "improvement-v2" as AppPage, label: "EnnoAmélioration", icon: FilePenLine },
 ]
 
 
@@ -557,7 +552,6 @@ export default function AppShell({
               "diagnosis",
               "scholar",
               "scholar-v66",
-              "improvement",
               "improvement-v2",
             ]),
           },
@@ -589,7 +583,6 @@ export default function AppShell({
               "diagnosis",
               "scholar",
               "scholar-v66",
-              "improvement",
               "improvement-v2",
             ]),
           },
@@ -611,7 +604,6 @@ export default function AppShell({
             "diagnosis",
             "scholar",
             "scholar-v66",
-            "improvement",
             "improvement-v2",
           ]),
         },
@@ -1276,7 +1268,7 @@ export default function AppShell({
                             )}
                           >
 
-                            {!collapsed && item.id === "scholar-v66" && <span className="shrink-0 whitespace-nowrap rounded-full bg-brand/10 px-1.5 py-0.5 text-[10px] font-semibold text-brand">Nouveau</span>}
+                            {!collapsed && (item.id === "scholar-v66" || item.id === "improvement-v2") && <span className="shrink-0 whitespace-nowrap rounded-full bg-brand/10 px-1.5 py-0.5 text-[10px] font-semibold text-brand">Nouveau</span>}
 
                             <Icon
                               className={cn(
